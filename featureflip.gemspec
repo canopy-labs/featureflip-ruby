@@ -12,7 +12,8 @@ Gem::Specification.new do |spec|
 
   spec.metadata = {
     "homepage_uri" => "https://featureflip.io",
-    "documentation_uri" => "https://featureflip.io/docs/sdks/ruby/"
+    "documentation_uri" => "https://featureflip.io/docs/sdks/ruby/",
+    "source_code_uri" => "https://github.com/canopy-labs/featureflip-ruby"
   }
 
   spec.files = Dir["lib/**/*.rb"]
