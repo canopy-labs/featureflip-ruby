@@ -22,7 +22,7 @@ gem install featureflip
 require "featureflip"
 
 # Initialize the client (blocks until flags are loaded)
-client = Featureflip::Client.new(sdk_key: "your-sdk-key")
+client = Featureflip::Client.get("your-sdk-key")
 
 # Evaluate a feature flag
 enabled = client.bool_variation("my-feature", { "user_id" => "user-123" }, false)
@@ -53,7 +53,7 @@ config = Featureflip::Config.new(
   max_stream_retries: 5,                      # SSE retries before falling back to polling
 )
 
-client = Featureflip::Client.new(sdk_key: "your-sdk-key", config: config)
+client = Featureflip::Client.get("your-sdk-key", config: config)
 ```
 
 The SDK key can also be set via the `FEATUREFLIP_SDK_KEY` environment variable.
@@ -74,6 +74,21 @@ enabled = Featureflip.bool_variation("my-feature", { "user_id" => "123" }, false
 # On shutdown
 Featureflip.close
 ```
+
+## Lifetime
+
+`Client.get` returns handles backed by a shared core keyed by SDK key. Multiple calls with the same key share one set of connections and background threads:
+
+```ruby
+client1 = Featureflip::Client.get("sdk-key")
+client2 = Featureflip::Client.get("sdk-key")
+# client1 and client2 share the same underlying resources
+
+client1.close  # Resources still alive — client2 holds a reference
+client2.close  # Now resources are cleaned up
+```
+
+This makes the SDK safe to use in dependency injection containers regardless of lifetime registration (singleton, scoped, or transient).
 
 ## Evaluation
 

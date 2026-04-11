@@ -13,6 +13,7 @@ require_relative "featureflip/events/event"
 require_relative "featureflip/events/event_processor"
 require_relative "featureflip/data_source/streaming"
 require_relative "featureflip/data_source/polling"
+require_relative "featureflip/shared_core"
 require_relative "featureflip/client"
 
 module Featureflip
@@ -26,7 +27,7 @@ module Featureflip
         @config = Config.new
         yield @config if block_given?
         @config.validate!
-        @default_client = Client.new(sdk_key: @config.sdk_key, config: @config)
+        @default_client = Client.get(@config.sdk_key, config: @config)
       end
     end
 

@@ -64,9 +64,9 @@ RSpec.describe Featureflip::Client do
       .to_return(status: 200, body: response_body, headers: { "Content-Type" => "application/json" })
   end
 
-  describe "#initialize" do
+  describe ".get factory" do
     it "raises ConfigurationError without SDK key" do
-      expect { described_class.new(config: config) }
+      expect { described_class.get(config: config) }
         .to raise_error(Featureflip::ConfigurationError, /SDK key is required/)
     end
 
@@ -78,7 +78,7 @@ RSpec.describe Featureflip::Client do
         .to_return(status: 200, body: { "flags" => [], "segments" => [] }.to_json,
                    headers: { "Content-Type" => "application/json" })
 
-      client = described_class.new(config: config)
+      client = described_class.get(config: config)
       expect(client.initialized?).to be true
       client.close
     ensure
@@ -97,24 +97,34 @@ RSpec.describe Featureflip::Client do
         init_timeout: 1
       )
 
-      expect { described_class.new(sdk_key: sdk_key, config: timeout_config) }
+      expect { described_class.get(sdk_key, config: timeout_config) }
         .to raise_error(Featureflip::InitializationError)
+    end
+
+    it "returns handles sharing the same core for same key" do
+      stub_flags_request
+      client1 = described_class.get(sdk_key, config: config)
+      client2 = described_class.get(sdk_key, config: config)
+
+      expect(client1.instance_variable_get(:@core).equal?(client2.instance_variable_get(:@core))).to be true
+
+      client1.close
+      client2.close
+    end
+
+    it "does not allow Client.new directly" do
+      expect { described_class.new(double("core")) }
+        .to raise_error(NoMethodError, /private/)
     end
   end
 
   describe "with initialized client" do
     let!(:client) do
       stub_flags_request
-      described_class.new(sdk_key: sdk_key, config: config)
+      described_class.get(sdk_key, config: config)
     end
 
     after { client.close }
-
-    describe "#initialized?" do
-      it "returns true after successful init" do
-        expect(client.initialized?).to be true
-      end
-    end
 
     describe "#bool_variation" do
       it "returns flag value for enabled flag" do
@@ -194,6 +204,45 @@ RSpec.describe Featureflip::Client do
     end
   end
 
+  describe "closed handle behavior" do
+    let!(:client) do
+      stub_flags_request
+      described_class.get(sdk_key, config: config)
+    end
+
+    it "returns default values after close" do
+      client.close
+      expect(client.bool_variation("dark-mode", { "user_id" => "user1" }, false)).to be false
+      expect(client.string_variation("greeting", { "user_id" => "user1" }, "default")).to eq("default")
+      expect(client.number_variation("missing", { "user_id" => "user1" }, 42)).to eq(42)
+      expect(client.json_variation("missing", { "user_id" => "user1" }, { "a" => 1 })).to eq({ "a" => 1 })
+    end
+
+    it "returns Error reason from variation_detail after close" do
+      client.close
+      detail = client.variation_detail("dark-mode", { "user_id" => "user1" }, false)
+      expect(detail.value).to be false
+      expect(detail.reason).to eq("Error")
+    end
+
+    it "double-close is idempotent" do
+      expect { client.close }.not_to raise_error
+      expect { client.close }.not_to raise_error
+    end
+
+    it "closing one of two handles keeps the other alive" do
+      stub_flags_request
+      client2 = described_class.get(sdk_key, config: config)
+
+      client.close
+      # client2 should still work because the core is still alive
+      result = client2.bool_variation("dark-mode", { "user_id" => "user1" }, false)
+      expect(result).to be true
+
+      client2.close
+    end
+  end
+
   describe "event payloads" do
     let(:events_config) do
       Featureflip::Config.new(
@@ -206,14 +255,14 @@ RSpec.describe Featureflip::Client do
     let!(:client) do
       stub_flags_request
       stub_request(:post, "#{base_url}/v1/sdk/events").to_return(status: 200, body: "")
-      described_class.new(sdk_key: sdk_key, config: events_config)
+      described_class.get(sdk_key, config: events_config)
     end
 
     after { client.close }
 
     describe "#track" do
       it "queues event with PascalCase type and flagKey" do
-        event_processor = client.instance_variable_get(:@event_processor)
+        event_processor = client.instance_variable_get(:@core).instance_variable_get(:@event_processor)
         allow(event_processor).to receive(:queue_event).and_call_original
 
         client.track("purchase", { "user_id" => "user1" }, { "amount" => 99 })
@@ -228,7 +277,7 @@ RSpec.describe Featureflip::Client do
       end
 
       it "does not include event_name or context fields" do
-        event_processor = client.instance_variable_get(:@event_processor)
+        event_processor = client.instance_variable_get(:@core).instance_variable_get(:@event_processor)
         allow(event_processor).to receive(:queue_event).and_call_original
 
         client.track("purchase", { "user_id" => "user1" })
@@ -241,7 +290,7 @@ RSpec.describe Featureflip::Client do
 
     describe "#identify" do
       it "queues event with PascalCase type and userId" do
-        event_processor = client.instance_variable_get(:@event_processor)
+        event_processor = client.instance_variable_get(:@core).instance_variable_get(:@event_processor)
         allow(event_processor).to receive(:queue_event).and_call_original
 
         client.identify({ "user_id" => "user1" })
@@ -255,7 +304,7 @@ RSpec.describe Featureflip::Client do
       end
 
       it "includes flagKey '$identify' per SDK event contract" do
-        event_processor = client.instance_variable_get(:@event_processor)
+        event_processor = client.instance_variable_get(:@core).instance_variable_get(:@event_processor)
         allow(event_processor).to receive(:queue_event).and_call_original
 
         client.identify({ "user_id" => "user1" })
@@ -270,7 +319,7 @@ RSpec.describe Featureflip::Client do
 
     describe "#variation_detail evaluation event" do
       it "queues event with PascalCase type and camelCase keys" do
-        event_processor = client.instance_variable_get(:@event_processor)
+        event_processor = client.instance_variable_get(:@core).instance_variable_get(:@event_processor)
         allow(event_processor).to receive(:queue_event).and_call_original
 
         client.variation_detail("dark-mode", { "user_id" => "user1" }, false)
@@ -285,7 +334,7 @@ RSpec.describe Featureflip::Client do
       end
 
       it "does not include snake_case keys" do
-        event_processor = client.instance_variable_get(:@event_processor)
+        event_processor = client.instance_variable_get(:@core).instance_variable_get(:@event_processor)
         allow(event_processor).to receive(:queue_event).and_call_original
 
         client.variation_detail("dark-mode", { "user_id" => "user1" }, false)
@@ -293,13 +342,6 @@ RSpec.describe Featureflip::Client do
         expect(event_processor).to have_received(:queue_event).with(
           hash_not_including(:flag_key, :user_id)
         )
-      end
-    end
-
-    describe "#close" do
-      it "can be called multiple times" do
-        expect { client.close }.not_to raise_error
-        expect { client.close }.not_to raise_error
       end
     end
   end
