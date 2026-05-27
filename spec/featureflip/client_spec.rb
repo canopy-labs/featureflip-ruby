@@ -204,6 +204,62 @@ RSpec.describe Featureflip::Client do
     end
   end
 
+  describe "prerequisite evaluation" do
+    let(:prereq_response) do
+      {
+        "flags" => [
+          {
+            "key" => "parent",
+            "version" => 1,
+            "type" => "Boolean",
+            "enabled" => true,
+            "variations" => [
+              { "key" => "on", "value" => true },
+              { "key" => "off", "value" => false }
+            ],
+            "rules" => [],
+            "fallthrough" => { "type" => "Fixed", "variation" => "off" },
+            "offVariation" => "off"
+          },
+          {
+            "key" => "child",
+            "version" => 1,
+            "type" => "Boolean",
+            "enabled" => true,
+            "variations" => [
+              { "key" => "on", "value" => true },
+              { "key" => "off", "value" => false }
+            ],
+            "rules" => [],
+            "fallthrough" => { "type" => "Fixed", "variation" => "on" },
+            "offVariation" => "off",
+            "prerequisites" => [
+              { "prerequisiteFlagKey" => "parent", "expectedVariationKey" => "on" }
+            ]
+          }
+        ],
+        "segments" => []
+      }.to_json
+    end
+
+    let!(:prereq_client) do
+      stub_flags_request(response_body: prereq_response)
+      described_class.get(sdk_key, config: config)
+    end
+
+    after do
+      prereq_client.close
+    end
+
+    it "serves off-variation with prerequisite-failed reason when parent does not match" do
+      detail = prereq_client.variation_detail("child", { "user_id" => "u1" }, false)
+      expect(detail.value).to eq(false)
+      expect(detail.reason).to eq("PrerequisiteFailed")
+      expect(detail.variation_key).to eq("off")
+      expect(detail.prerequisite_key).to eq("parent")
+    end
+  end
+
   describe "closed handle behavior" do
     let!(:client) do
       stub_flags_request

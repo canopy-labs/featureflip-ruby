@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.1.0
+
+### Added
+
+- **Prerequisite flag evaluation.** Flags can declare prerequisites that must serve a specific variation for the flag to evaluate normally. When a prerequisite is not satisfied, the flag serves its off-variation with reason `PrerequisiteFailed` and a `prerequisite_key` field on `EvaluationDetail`.
+- Recursive prerequisite resolution with per-call memoization and a depth cap (`MAX_PREREQUISITE_DEPTH = 10`).
+- `Evaluator#evaluate_with_shared_memo` for batch evaluations to share prerequisite results.
+
 ## 2.0.0
 
 ### Breaking Changes

@@ -28,6 +28,10 @@ module Featureflip
         @mutex.synchronize { @flags.values }
       end
 
+      def all_flags_map
+        @mutex.synchronize { @flags.dup }
+      end
+
       def upsert(flag)
         @mutex.synchronize do
           existing = @flags[flag.key]

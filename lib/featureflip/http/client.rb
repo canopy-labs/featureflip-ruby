@@ -82,7 +82,15 @@ module Featureflip
           variations: (data["variations"] || []).map { |v| Models::Variation.new(key: v["key"], value: v["value"]) },
           rules: (data["rules"] || []).map { |r| parse_rule(r) },
           fallthrough: parse_serve(data["fallthrough"]),
-          off_variation: data["offVariation"]
+          off_variation: data["offVariation"],
+          prerequisites: (data["prerequisites"] || []).map { |p| parse_prerequisite(p) }
+        )
+      end
+
+      def parse_prerequisite(data)
+        Models::Prerequisite.new(
+          prerequisite_flag_key: data["prerequisiteFlagKey"],
+          expected_variation_key: data["expectedVariationKey"]
         )
       end
 

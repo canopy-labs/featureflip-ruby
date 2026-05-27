@@ -135,7 +135,12 @@ module Featureflip
         return Models::EvaluationDetail.new(value: default_value, reason: "FlagNotFound")
       end
 
-      result = @evaluator.evaluate(flag, context, get_segment: method(:get_segment))
+      result = @evaluator.evaluate(
+        flag,
+        context,
+        get_segment: method(:get_segment),
+        all_flags: @store.all_flags_map
+      )
       value = result.value.nil? ? default_value : result.value
       record_evaluation(key, context, result.variation_key)
 
@@ -143,10 +148,14 @@ module Featureflip
         value: value,
         reason: result.reason,
         rule_id: result.rule_id,
-        variation_key: result.variation_key
+        variation_key: result.variation_key,
+        prerequisite_key: result.prerequisite_key
       )
     rescue StandardError
-      Models::EvaluationDetail.new(value: default_value, reason: "Error")
+      # Prerequisite-resolution failures return PrerequisiteFailed cleanly through
+      # the evaluator; this rescue only fires on unexpected exceptions (malformed
+      # config, programming errors), so prerequisite_key has no defined value.
+      Models::EvaluationDetail.new(value: default_value, reason: "Error", prerequisite_key: nil)
     end
 
     # --- Event methods ---

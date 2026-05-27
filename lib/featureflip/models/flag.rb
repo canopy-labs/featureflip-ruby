@@ -28,7 +28,16 @@ module Featureflip
       end
     end
 
-    FlagConfiguration = Struct.new(:key, :version, :type, :enabled, :variations, :rules, :fallthrough, :off_variation, keyword_init: true) do
+    Prerequisite = Struct.new(:prerequisite_flag_key, :expected_variation_key, keyword_init: true)
+
+    FlagConfiguration = Struct.new(
+      :key, :version, :type, :enabled, :variations, :rules, :fallthrough, :off_variation, :prerequisites,
+      keyword_init: true
+    ) do
+      def initialize(key:, version:, type:, enabled:, variations:, rules:, fallthrough:, off_variation:, prerequisites: [])
+        super
+      end
+
       def get_variation(key)
         @variations_by_key ||= variations.each_with_object({}) { |v, h| h[v.key] = v }
         @variations_by_key[key]

@@ -1,7 +1,7 @@
 PATH
   remote: .
   specs:
-    featureflip (2.0.0)
+    featureflip (2.1.0)
 
 GEM
   remote: https://rubygems.org/

@@ -140,6 +140,59 @@ RSpec.describe Featureflip::Http::Client do
     end
   end
 
+  describe "prerequisite parsing" do
+    let(:flag_with_prereqs) do
+      {
+        "flags" => [
+          {
+            "key" => "dependent-flag",
+            "version" => 1,
+            "type" => "Boolean",
+            "enabled" => true,
+            "variations" => [
+              { "key" => "on", "value" => true },
+              { "key" => "off", "value" => false }
+            ],
+            "rules" => [],
+            "fallthrough" => { "type" => "Fixed", "variation" => "on" },
+            "offVariation" => "off",
+            "prerequisites" => [
+              { "prerequisiteFlagKey" => "parent-a", "expectedVariationKey" => "on" },
+              { "prerequisiteFlagKey" => "parent-b", "expectedVariationKey" => "blue" }
+            ]
+          }
+        ],
+        "segments" => []
+      }
+    end
+
+    it "parses prerequisites from the wire format" do
+      stub_request(:get, "https://eval.featureflip.io/v1/sdk/flags")
+        .to_return(status: 200, body: flag_with_prereqs.to_json, headers: { "Content-Type" => "application/json" })
+
+      flags, _segments = client.get_flags
+      flag = flags.first
+
+      expect(flag.prerequisites.length).to eq(2)
+      expect(flag.prerequisites[0].prerequisite_flag_key).to eq("parent-a")
+      expect(flag.prerequisites[0].expected_variation_key).to eq("on")
+      expect(flag.prerequisites[1].prerequisite_flag_key).to eq("parent-b")
+      expect(flag.prerequisites[1].expected_variation_key).to eq("blue")
+    end
+
+    it "defaults prerequisites to an empty list when absent" do
+      response_without_prereqs = {
+        "flags" => [flag_with_prereqs["flags"].first.reject { |k, _| k == "prerequisites" }],
+        "segments" => []
+      }
+      stub_request(:get, "https://eval.featureflip.io/v1/sdk/flags")
+        .to_return(status: 200, body: response_without_prereqs.to_json, headers: { "Content-Type" => "application/json" })
+
+      flags, _segments = client.get_flags
+      expect(flags.first.prerequisites).to eq([])
+    end
+  end
+
   describe "#post_events" do
     it "posts events to API" do
       stub_request(:post, "https://eval.featureflip.io/v1/sdk/events")
