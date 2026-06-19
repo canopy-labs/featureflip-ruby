@@ -19,6 +19,11 @@ Gem::Specification.new do |spec|
   spec.files = Dir["lib/**/*.rb"]
   spec.require_paths = ["lib"]
 
+  # logger was a default gem through Ruby 3.4 but is no longer bundled in
+  # Ruby 3.5+/4.0; the SDK requires it at runtime (lib/featureflip/config.rb),
+  # so it must be declared or `require "logger"` fails under Bundler.
+  spec.add_dependency "logger"
+
   spec.add_development_dependency "rspec", "~> 3.13"
   spec.add_development_dependency "webmock", "~> 3.23"
   spec.add_development_dependency "simplecov", "~> 0.22"

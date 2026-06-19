@@ -180,6 +180,25 @@ RSpec.describe Featureflip::Evaluation::Evaluator do
 
         expect(result.reason).to eq("Fallthrough")
       end
+
+      it "does not match when no segment source is provided (#1459)" do
+        rule = make_rule(
+          id: "seg-rule",
+          priority: 1,
+          conditions: [],
+          segment_key: "beta-users"
+        )
+        flag = make_flag(rules: [rule], fallthrough_variation: "false")
+
+        # No get_segment passed -> the segment source is not wired, so the
+        # segment cannot be resolved. The rule must fail closed (no match),
+        # mirroring the engine + C# SDK, rather than falling through to its
+        # empty condition groups (which match unconditionally).
+        result = evaluator.evaluate(flag, { "email" => "user@test.com" })
+
+        expect(result.reason).to eq("Fallthrough")
+        expect(result.variation_key).to eq("false")
+      end
     end
 
     context "rollout serve config" do
@@ -235,6 +254,71 @@ RSpec.describe Featureflip::Evaluation::Evaluator do
         # With 50/50 split over 100 users, both values should appear
         expect(values).to include(true)
         expect(values).to include(false)
+      end
+
+      it "serves the control (first) variation for a keyless context (#1457)" do
+        # A thin control weight (1) means the old empty-string-hash collapse
+        # would virtually never land on "on" -- so this asserts the keyless
+        # guard, not the hash. Anonymous contexts can't be bucketed, so we
+        # serve the control deterministically rather than hashing the empty
+        # value into an arbitrary salt-dependent bucket.
+        wv_on = Featureflip::Models::WeightedVariation.new(key: "on", weight: 1)
+        wv_off = Featureflip::Models::WeightedVariation.new(key: "off", weight: 99)
+
+        on_variation = Featureflip::Models::Variation.new(key: "on", value: true)
+        off_variation = Featureflip::Models::Variation.new(key: "off", value: false)
+
+        flag = Featureflip::Models::FlagConfiguration.new(
+          key: "rollout-flag",
+          version: 1,
+          type: "Boolean",
+          enabled: true,
+          variations: [on_variation, off_variation],
+          rules: [],
+          fallthrough: Featureflip::Models::ServeConfig.new(
+            type: "Rollout",
+            bucket_by: "userId",
+            salt: "test-salt",
+            variations: [wv_on, wv_off]
+          ),
+          off_variation: "off"
+        )
+
+        results = 20.times.map { evaluator.evaluate(flag, {}) }
+
+        expect(results.map(&:variation_key).uniq).to eq(["on"])
+        expect(results.map(&:value).uniq).to eq([true])
+        expect(results.map(&:reason).uniq).to eq(["Fallthrough"])
+      end
+
+      it "serves the default variation when a rollout serve has no variations (#1469)" do
+        # Env-level PercentageRollout emits a Rollout serve with its default variation set but
+        # no weighted variations (no per-variation weight storage at the env level). Degrade to
+        # the default variation instead of returning an empty key. Mirrors the engine + C#/Java.
+        on_variation = Featureflip::Models::Variation.new(key: "on", value: true)
+        off_variation = Featureflip::Models::Variation.new(key: "off", value: false)
+
+        flag = Featureflip::Models::FlagConfiguration.new(
+          key: "rollout-flag",
+          version: 1,
+          type: "Boolean",
+          enabled: true,
+          variations: [on_variation, off_variation],
+          rules: [],
+          fallthrough: Featureflip::Models::ServeConfig.new(
+            type: "Rollout",
+            bucket_by: "userId",
+            variation: "off",
+            variations: []
+          ),
+          off_variation: "off"
+        )
+
+        result = evaluator.evaluate(flag, { "userId" => "user-1" })
+
+        expect(result.variation_key).to eq("off")
+        expect(result.value).to eq(false)
+        expect(result.reason).to eq("Fallthrough")
       end
 
       it "uses rollout in rule serve config" do

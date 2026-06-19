@@ -37,12 +37,21 @@ module Featureflip
 
         sorted_rules = flag.rules.sort_by(&:priority)
         sorted_rules.each do |rule|
-          conditions_match = if rule.segment_key && get_segment
-            segment = get_segment.call(rule.segment_key)
-            if segment
-              @condition_evaluator.evaluate_conditions(
-                segment.conditions, segment.condition_logic, context
-              )
+          conditions_match = if rule.segment_key && !rule.segment_key.empty?
+            # A segment-keyed rule must resolve its segment to match. If the
+            # segment source isn't wired (get_segment is nil), or the segment
+            # can't be found, fail closed (no match) -- mirroring the engine +
+            # C# SDK -- rather than falling through to the rule's condition
+            # groups (which match unconditionally when empty). See #1459.
+            if get_segment
+              segment = get_segment.call(rule.segment_key)
+              if segment
+                @condition_evaluator.evaluate_conditions(
+                  segment.conditions, segment.condition_logic, context
+                )
+              else
+                false
+              end
             else
               false
             end
@@ -138,6 +147,21 @@ module Featureflip
         bucket_value = context["userId"] if bucket_value.nil? && bucket_by == "user_id"
         bucket_value_str = bucket_value.nil? ? "" : bucket_value.to_s
 
+        # A Rollout serve can arrive with no weighted variations -- env-level PercentageRollout
+        # has nowhere to store per-variation weights, so the mapper emits type=Rollout with no
+        # variations (#1469). Degrade to the default fixed variation instead of returning an
+        # empty key. Mirrors the engine + C#/Java SDK evaluators.
+        return serve.variation || "" if (serve.variations || []).empty?
+
+        # Keyless user contexts can't be bucketed. Rather than hashing the empty value
+        # into an arbitrary salt-dependent bucket, serve the control (first) variation
+        # deterministically. The engine assigns a random GUID per eval (spreading
+        # anonymous users over HTTP); local SDK eval is deterministic, so parity is
+        # guaranteed only for keyed contexts (#1457).
+        if bucket_value_str == "" && %w[userId user_id].include?(bucket_by) && !(serve.variations || []).empty?
+          return serve.variations[0].key
+        end
+
         bucket = Bucketing.compute_bucket(serve.salt || "", bucket_value_str)
 
         cumulative = 0
@@ -146,7 +170,8 @@ module Featureflip
           return wv.key if bucket < cumulative
         end
 
-        serve.variations&.last&.key || ""
+        # Guaranteed non-empty: the no-variations case returned the default above.
+        serve.variations.last.key
       end
     end
   end
