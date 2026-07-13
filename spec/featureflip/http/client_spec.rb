@@ -105,6 +105,22 @@ RSpec.describe Featureflip::Http::Client do
     end
   end
 
+  describe "#parse_flags_response" do
+    it "parses a snapshot hash into flag and segment models (no HTTP)" do
+      flags, segments = client.parse_flags_response(flags_response)
+
+      expect(flags.map(&:key)).to eq(["dark-mode"])
+      expect(flags.first.version).to eq(3)
+      expect(segments.map(&:key)).to eq(["beta-users"])
+    end
+
+    it "tolerates a snapshot with no flags or segments" do
+      flags, segments = client.parse_flags_response({})
+      expect(flags).to eq([])
+      expect(segments).to eq([])
+    end
+  end
+
   describe "#get_flags error handling" do
     it "raises Featureflip::Error on HTTP 500 after retry" do
       stub_request(:get, "https://eval.featureflip.io/v1/sdk/flags")

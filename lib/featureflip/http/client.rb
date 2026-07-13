@@ -13,7 +13,13 @@ module Featureflip
 
       def get_flags
         response = request(:get, "/v1/sdk/flags")
-        data = JSON.parse(response.body)
+        parse_flags_response(JSON.parse(response.body))
+      end
+
+      # Parse a GET /v1/sdk/flags-shaped snapshot into models. Reused for the
+      # connect-time `sync` SSE snapshot, which carries the identical payload
+      # shape inline (no extra HTTP round-trip).
+      def parse_flags_response(data)
         flags = (data["flags"] || []).map { |f| parse_flag(f) }
         segments = (data["segments"] || []).map { |s| parse_segment(s) }
         [flags, segments]

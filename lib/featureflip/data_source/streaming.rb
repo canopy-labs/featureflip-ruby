@@ -5,7 +5,38 @@ require "json"
 module Featureflip
   module DataSource
     class StreamingHandler
-      def initialize(sdk_key:, config:, http_client:, on_flag_updated:, on_flag_deleted:, on_segment_updated:, on_error:, on_give_up: nil)
+      # Raised into the streaming thread by #stop to interrupt a blocking read
+      # (Thread#wakeup only wakes a *sleeping* thread; it can't interrupt an
+      # MRI IO read — Thread#raise can). Inherits from Exception, not
+      # StandardError, so it bypasses handle_event's/run's generic `rescue
+      # StandardError` arms (which would otherwise swallow a stop mid-event and
+      # leave the thread blocking) and is only caught by the explicit
+      # `rescue StreamStopped`.
+      class StreamStopped < Exception; end # rubocop:disable Lint/InheritException
+
+      # The server sends a keep-alive ping this often; a finite read timeout at
+      # or below this interval would sever a healthy stream.
+      SERVER_PING_INTERVAL_SECONDS = 30
+
+      # Client-side liveness watchdog. net/http gives us no separate heartbeat,
+      # so the read timeout IS the watchdog: if no data (not even a ping) arrives
+      # for this long the socket is treated as dead — a half-open connection
+      # (LB/NAT idle-drop or a partition with no FIN/RST) — and the blocking read
+      # raises Net::ReadTimeout, which drives reconnect/backoff/polling. Set to
+      # 3× the ping (3 missed pings) so it never severs a healthy stream but still
+      # detects a dead socket within a bounded time. MUST stay finite and
+      # > SERVER_PING_INTERVAL_SECONDS. (The rest of the family runs an infinite
+      # read timeout — java readTimeout(0) / python read=None / csharp #1526 —
+      # and has the same latent half-open hole; ruby closes it here.)
+      STREAM_READ_TIMEOUT = SERVER_PING_INTERVAL_SECONDS * 3
+
+      # Base reconnect backoff; also the floor applied after a healthy stream
+      # closes cleanly, so even an accept-then-immediately-close server is
+      # throttled instead of busy-looping.
+      RECONNECT_BASE_DELAY_SECONDS = 1
+      MAX_BACKOFF_SECONDS = 30
+
+      def initialize(sdk_key:, config:, http_client:, on_flag_updated:, on_flag_deleted:, on_segment_updated:, on_error:, on_sync: nil, on_give_up: nil)
         @sdk_key = sdk_key
         @config = config
         @http_client = http_client
@@ -13,12 +44,17 @@ module Featureflip
         @on_flag_deleted = on_flag_deleted
         @on_segment_updated = on_segment_updated
         @on_error = on_error
+        @on_sync = on_sync
         @on_give_up = on_give_up
         @stop_flag = false
         @thread = nil
         @retry_count = 0
         @current_event_type = nil
         @current_data = nil
+        @line_buffer = String.new # ASCII-8BIT: raw read_body bytes concatenate safely
+        @delivered_frame = false
+        @wake_mutex = Mutex.new
+        @wake_cond = ConditionVariable.new
       end
 
       def start
@@ -29,9 +65,21 @@ module Featureflip
 
       def stop
         @stop_flag = true
-        @thread&.wakeup rescue nil
-        @thread&.join(5)
+        # Wake an in-progress backoff wait.
+        @wake_mutex.synchronize { @wake_cond.broadcast }
+
+        thread = @thread
         @thread = nil
+        return unless thread
+
+        # Interrupt a thread blocked in read_body. Guard the raise: the thread may
+        # finish between the alive? check and the raise (ThreadError on a dead one).
+        begin
+          thread.raise(StreamStopped.new) if thread.alive?
+        rescue ThreadError
+          # Thread already finished — nothing to interrupt.
+        end
+        thread.join(5)
       end
 
       private
@@ -40,26 +88,57 @@ module Featureflip
         until @stop_flag
           begin
             connect
+          rescue StreamStopped
+            break
           rescue StandardError => e
             break if @stop_flag
             @on_error.call(e)
+          end
+          break if @stop_flag
+
+          # Consult @delivered_frame (the instance var), NOT connect's return
+          # value: connect only *returns* on a clean EOF, but the common stream
+          # terminations (the liveness-watchdog Net::ReadTimeout, ECONNRESET,
+          # IOError) RAISE — and a session that delivered frames before raising
+          # must still count as healthy, or transient blips accumulate and
+          # wrongly degrade a good stream to polling. @delivered_frame survives
+          # the exception; connect resets it to false at the top of each attempt.
+          if @delivered_frame
+            # The stream genuinely stayed up (delivered ≥1 frame — the server
+            # sends `sync` first). Reset the failure counter.
+            @retry_count = 0
+          else
+            # A clean EOF (no frame) is treated as a failure for backoff/escalation
+            # purposes — otherwise an accept-then-close server never accumulates
+            # toward max_stream_retries and never degrades to polling.
             @retry_count += 1
             if @retry_count > @config.max_stream_retries
               @on_give_up&.call
               break
             end
-            delay = [2**(@retry_count - 1), 30].min
-            sleep(delay)
           end
+
+          # Back off before every reconnect, including after a clean EOF, so we
+          # never zero-delay busy-loop against a flapping endpoint.
+          backoff_wait(backoff_delay(@retry_count))
         end
+      rescue StreamStopped
+        # stop() interrupted a backoff wait — clean shutdown.
       end
 
+      # Connect to the SSE stream and process events until the connection ends.
+      # Returns true if the stream delivered at least one complete frame (a live
+      # stream), false if it returned 200 but closed without delivering one.
       def connect
+        # Reset before anything can raise (a failed handshake / connection error
+        # must not let run() read a stale `true` from the previous session).
+        @delivered_frame = false
+
         uri = URI("#{@config.base_url}/v1/sdk/stream")
         http = Net::HTTP.new(uri.host, uri.port)
         http.use_ssl = uri.scheme == "https"
         http.open_timeout = @config.connect_timeout
-        http.read_timeout = 300 # 5 min — detect silent TCP drops
+        http.read_timeout = STREAM_READ_TIMEOUT
 
         req = Net::HTTP::Get.new(uri.request_uri)
         req["Authorization"] = @sdk_key
@@ -71,16 +150,31 @@ module Featureflip
             raise Featureflip::Error, "SSE connection failed: #{response.code}"
           end
 
-          @retry_count = 0
-          @current_event_type = nil
-          @current_data = nil
-
+          reset_stream_parser
           response.read_body do |chunk|
             break if @stop_flag
-            chunk.each_line do |line|
-              process_sse_line(line.strip)
-            end
+            feed_chunk(chunk)
           end
+        end
+
+        @delivered_frame
+      end
+
+      def reset_stream_parser
+        @current_event_type = nil
+        @current_data = nil
+        @line_buffer = String.new # ASCII-8BIT: raw read_body bytes concatenate safely
+      end
+
+      # Append a raw SSE body chunk and dispatch every *complete* line it
+      # completes. Net::HTTP#read_body yields arbitrary byte fragments with no
+      # line alignment, so a line (or a `data:` payload) can span chunk
+      # boundaries; buffer until a newline before parsing.
+      def feed_chunk(chunk)
+        @line_buffer << chunk
+        while (newline_index = @line_buffer.index("\n"))
+          line = @line_buffer.slice!(0, newline_index + 1)
+          process_sse_line(line.chomp.force_encoding(Encoding::UTF_8))
         end
       end
 
@@ -88,11 +182,32 @@ module Featureflip
         if line.start_with?("event: ")
           @current_event_type = line[7..]
         elsif line.start_with?("data: ")
-          @current_data = line[6..]
+          # Per the SSE spec multiple data: lines join with "\n" — concatenate,
+          # never overwrite, or a chunked/multi-line payload loses everything but
+          # its last fragment.
+          fragment = line[6..]
+          @current_data = @current_data.nil? ? fragment : "#{@current_data}\n#{fragment}"
         elsif line.empty? && @current_event_type && @current_data
+          @delivered_frame = true
           handle_event(@current_event_type, @current_data)
           @current_event_type = nil
           @current_data = nil
+        end
+      end
+
+      # Capped exponential backoff. failures == 0 means a healthy stream just
+      # closed cleanly; still apply the base floor so we don't busy-loop.
+      def backoff_delay(failures)
+        exponent = failures <= 0 ? 0 : failures - 1
+        [RECONNECT_BASE_DELAY_SECONDS * (2**exponent), MAX_BACKOFF_SECONDS].min
+      end
+
+      # Sleep for `seconds`, but return immediately if stop() fires — so a pending
+      # shutdown isn't blocked behind a long backoff.
+      def backoff_wait(seconds)
+        @wake_mutex.synchronize do
+          return if @stop_flag
+          @wake_cond.wait(@wake_mutex, seconds)
         end
       end
 
@@ -112,6 +227,12 @@ module Featureflip
         when "segment.updated"
           flags, segments = @http_client.get_flags
           @on_segment_updated.call(flags, segments)
+        when "sync"
+          # Full config snapshot the server sends on (re)connect. Replace the
+          # whole store so flags changed OR deleted during a disconnect are
+          # re-synced. Full replace, never a per-key merge.
+          flags, segments = @http_client.parse_flags_response(JSON.parse(data))
+          @on_sync&.call(flags, segments)
         end
       rescue StandardError
         # Swallow event processing errors

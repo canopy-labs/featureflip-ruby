@@ -278,6 +278,7 @@ module Featureflip
         on_flag_updated: ->(flag) { @store.upsert(flag) },
         on_flag_deleted: ->(key) { @store.remove_flag(key) },
         on_segment_updated: ->(flags, segments) { @store.init(flags, segments) },
+        on_sync: ->(flags, segments) { @store.init(flags, segments) },
         on_error: ->(_err) { },
         on_give_up: -> { fallback_to_polling }
       )
