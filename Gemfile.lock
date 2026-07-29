@@ -1,7 +1,7 @@
 PATH
   remote: .
   specs:
-    featureflip (2.3.0)
+    featureflip (2.4.0)
       logger
 
 GEM
@@ -14,7 +14,6 @@ GEM
       bigdecimal
       rexml
     diff-lcs (1.6.2)
-    docile (1.4.1)
     hashdiff (1.2.1)
     logger (1.7.0)
     public_suffix (7.0.5)
@@ -32,12 +31,7 @@ GEM
       diff-lcs (>= 1.2.0, < 2.0)
       rspec-support (~> 3.13.0)
     rspec-support (3.13.7)
-    simplecov (0.22.0)
-      docile (~> 1.1)
-      simplecov-html (~> 0.11)
-      simplecov_json_formatter (~> 0.1)
-    simplecov-html (0.13.2)
-    simplecov_json_formatter (0.1.4)
+    simplecov (1.0.3)
     webmock (3.26.2)
       addressable (>= 2.8.0)
       crack (>= 0.3.2)
@@ -50,7 +44,7 @@ PLATFORMS
 DEPENDENCIES
   featureflip!
   rspec (~> 3.13)
-  simplecov (~> 0.22)
+  simplecov (~> 1.0)
   webmock (~> 3.23)
 
 BUNDLED WITH

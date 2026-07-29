@@ -4,6 +4,11 @@ module Featureflip
                   :flush_batch_size, :init_timeout, :connect_timeout, :read_timeout,
                   :max_stream_retries, :send_events, :logger
 
+    # Evaluation inspectors -- callables invoked once per variation call with a
+    # Models::EvaluationEvent. Always an Array; non-callable entries are dropped
+    # on assignment rather than blowing up on the evaluation hot path.
+    attr_reader :inspectors
+
     def initialize(
       sdk_key: nil,
       base_url: "https://eval.featureflip.io",
@@ -16,7 +21,8 @@ module Featureflip
       read_timeout: 10,
       max_stream_retries: 5,
       send_events: true,
-      logger: nil
+      logger: nil,
+      inspectors: nil
     )
       @sdk_key = sdk_key
       @base_url = base_url
@@ -30,8 +36,21 @@ module Featureflip
       @max_stream_retries = max_stream_retries
       @send_events = send_events
       @logger = logger || default_logger
+      self.inspectors = inspectors
 
       validate!
+    end
+
+    # Accepts a single callable or an array of callables. Anything that does not
+    # respond to #call is filtered out here, so the evaluation path never has to
+    # guard against it.
+    def inspectors=(value)
+      list = case value
+             when nil then []
+             when Array then value
+             else [value]
+             end
+      @inspectors = list.select { |i| i.respond_to?(:call) }.freeze
     end
 
     def validate!

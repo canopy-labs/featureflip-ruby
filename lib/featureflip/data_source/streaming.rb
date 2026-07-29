@@ -25,9 +25,9 @@ module Featureflip
       # raises Net::ReadTimeout, which drives reconnect/backoff/polling. Set to
       # 3× the ping (3 missed pings) so it never severs a healthy stream but still
       # detects a dead socket within a bounded time. MUST stay finite and
-      # > SERVER_PING_INTERVAL_SECONDS. (The rest of the family runs an infinite
-      # read timeout — java readTimeout(0) / python read=None / csharp #1526 —
-      # and has the same latent half-open hole; ruby closes it here.)
+      # > SERVER_PING_INTERVAL_SECONDS. (The rest of the server family now runs the
+      # same finite 90s watchdog — java readTimeout(90s) / python read=90.0 / csharp
+      # an idle-timeout CTS reset per event — so half-open detection is uniform.)
       STREAM_READ_TIMEOUT = SERVER_PING_INTERVAL_SECONDS * 3
 
       # Base reconnect backoff; also the floor applied after a healthy stream
