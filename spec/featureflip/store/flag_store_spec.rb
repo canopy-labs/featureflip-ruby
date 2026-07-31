@@ -3,12 +3,12 @@ require "spec_helper"
 RSpec.describe Featureflip::Store::FlagStore do
   let(:store) { described_class.new }
 
-  def make_flag(key:, version: 1)
+  def make_flag(key:, version: 1, enabled: true)
     Featureflip::Models::FlagConfiguration.new(
       key: key,
       version: version,
       type: "Boolean",
-      enabled: true,
+      enabled: enabled,
       variations: [],
       rules: [],
       fallthrough: Featureflip::Models::ServeConfig.new(type: "Fixed", variation: "true"),
@@ -84,13 +84,37 @@ RSpec.describe Featureflip::Store::FlagStore do
     end
 
     it "ignores lower version" do
-      current = make_flag(key: "f", version: 5)
-      old = make_flag(key: "f", version: 3)
+      current = make_flag(key: "f", version: 5, enabled: true)
+      old = make_flag(key: "f", version: 3, enabled: false)
       store.init([current], [])
 
       store.upsert(old)
 
       expect(store.get_flag("f").version).to eq(5)
+      expect(store.get_flag("f").enabled).to be(true)
+    end
+
+    # The wire version is second-granular (#2088), so two edits to one flag
+    # inside the same wall-clock second carry an identical version. Treating
+    # equal as stale discarded the second edit's config outright, and streaming
+    # disables polling, so no later snapshot corrected it — the SDK evaluated
+    # against the pre-edit config until an SSE `sync` or reconnect.
+    it "applies a same-version delta" do
+      store.init([make_flag(key: "f", version: 3, enabled: true)], [])
+
+      store.upsert(make_flag(key: "f", version: 3, enabled: false))
+
+      expect(store.get_flag("f").enabled).to be(false)
+    end
+
+    it "applies successive same-version deltas, keeping the newest" do
+      store.init([make_flag(key: "f", version: 7, enabled: true)], [])
+
+      store.upsert(make_flag(key: "f", version: 7, enabled: false))
+      expect(store.get_flag("f").enabled).to be(false)
+
+      store.upsert(make_flag(key: "f", version: 7, enabled: true))
+      expect(store.get_flag("f").enabled).to be(true)
     end
   end
 

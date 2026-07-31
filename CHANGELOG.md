@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.4.1 — 2026-07-30
+
+### Fixed
+
+- **A same-version flag delta is no longer discarded.** `FlagStore#upsert` rejected any incoming flag whose version was not strictly greater than the stored one. Because the wire version is second-granular, two edits to one flag inside the same wall-clock second carry an identical version, so the second edit's configuration was dropped — and with streaming enabled there is no polling snapshot to correct it, leaving evaluations on the pre-edit configuration until an SSE `sync` or reconnect. Only strictly older configurations are now treated as stale (#2101).
+
 ## 2.4.0 — 2026-07-29
 
 ### Added
