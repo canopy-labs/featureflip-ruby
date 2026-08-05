@@ -1,7 +1,7 @@
 PATH
   remote: .
   specs:
-    featureflip (2.4.1)
+    featureflip (2.4.2)
       logger
 
 GEM
