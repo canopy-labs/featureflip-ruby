@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.5.0 — 2026-08-20
+
+### Fixed
+
+- `initialized?` returns `false` after `close`. Every variation accessor was already guarded, so a closed client correctly served defaults while still claiming to be initialized. ([#2287](https://github.com/canopy-labs/featureflip/issues/2287))
+
+- Config payloads that violate the wire contract are rejected instead of being stored as-is and silently mis-evaluated. Values are compared against string literals, so a non-conforming payload was accepted without error and then targeted incorrectly forever. ([#2285](https://github.com/canopy-labs/featureflip/issues/2285))
+### Changed
+
+- A type-mismatched read returns the caller's default and reports `'Error'`, instead of doing no type checking at all and handing back the served value. Reading a String flag through a number accessor, say, is now detectable rather than silent. Matching reads and the generic/JSON accessors are unchanged. ([#2286](https://github.com/canopy-labs/featureflip/issues/2286))
 ## 2.4.2 — 2026-08-05
 
 ### Fixed

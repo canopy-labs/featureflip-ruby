@@ -136,23 +136,30 @@ module Featureflip
 
     # --- Evaluation methods ---
 
+    # The typed accessors declare the JSON type they expect so a mismatch degrades
+    # to the caller's default with reason "Error" (#2281/#2286). json_variation
+    # takes no expectation: its value is an arbitrary structure, so there is no
+    # single type to check it against.
     def bool_variation(key, context, default_value)
-      evaluate_flag(key, context, default_value)
+      evaluate_flag(key, context, default_value, expected: :bool)
     end
 
     def string_variation(key, context, default_value)
-      evaluate_flag(key, context, default_value)
+      evaluate_flag(key, context, default_value, expected: :string)
     end
 
     def number_variation(key, context, default_value)
-      evaluate_flag(key, context, default_value)
+      evaluate_flag(key, context, default_value, expected: :number)
     end
 
     def json_variation(key, context, default_value)
       evaluate_flag(key, context, default_value)
     end
 
-    def variation_detail(key, context, default_value)
+    # +expected+ is the JSON type the caller's accessor requires (:bool, :string
+    # or :number), or nil for the generic/JSON accessors, which are not
+    # type-checked because they have no single expected type.
+    def variation_detail(key, context, default_value, expected: nil)
       context = normalize_context(context)
 
       if @test_mode
@@ -190,7 +197,20 @@ module Featureflip
                  result.reason
                end
 
-      value = result.value.nil? ? default_value : result.value
+      served = result.value
+      value = served.nil? ? default_value : served
+
+      # A typed accessor asked for a specific JSON type and the SERVED value is not
+      # it. Degrade to the caller's default and report Error so the mismatch is
+      # detectable, rather than handing back a String where the caller's code
+      # expects true/false (#2281/#2286). Checking `served` rather than `value`
+      # matters: a variation whose value is genuinely JSON null has already been
+      # replaced by default_value above, and that substitute would pass any check.
+      if expected && !value_matches_type?(served, expected)
+        value = default_value
+        reason = "Error"
+      end
+
       record_evaluation(key, context, result.variation_key)
       notify_inspectors(
         key, context, value,
@@ -367,15 +387,25 @@ module Featureflip
       @event_processor.start
     end
 
-    def evaluate_flag(key, context, default_value)
+    def evaluate_flag(key, context, default_value, expected: nil)
       if @test_mode
         return @test_values.fetch(key, default_value)
       end
 
-      detail = variation_detail(key, context, default_value)
+      detail = variation_detail(key, context, default_value, expected: expected)
       detail.value
     rescue StandardError
       default_value
+    end
+
+    # True when +value+ is of the JSON type the caller's typed accessor requires.
+    def value_matches_type?(value, expected)
+      case expected
+      when :bool then value == true || value == false
+      when :string then value.is_a?(String)
+      when :number then value.is_a?(Numeric)
+      else true
+      end
     end
 
     def get_segment(key)

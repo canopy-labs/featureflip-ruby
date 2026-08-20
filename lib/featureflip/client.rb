@@ -16,7 +16,12 @@ module Featureflip
       new(core)
     end
 
+    # A closed handle reports false (#2287). Every variation accessor here was
+    # already guarded, so a closed client correctly served defaults while still
+    # claiming to be initialized. close releases the core -- stopping streaming
+    # and polling -- so the store it would read can never update again.
     def initialized?
+      return false if @closed
       @core.initialized?
     end
 

@@ -234,8 +234,23 @@ module Featureflip
           flags, segments = @http_client.parse_flags_response(JSON.parse(data))
           @on_sync&.call(flags, segments)
         end
-      rescue StandardError
-        # Swallow event processing errors
+      rescue MalformedPayloadError => e
+        # A payload that violates the wire contract is discarded WHOLESALE rather
+        # than partially applied — a half-parsed snapshot silently mis-evaluates
+        # every flag it touches, which is strictly worse than serving the previous
+        # config until the next frame. See packages/CLAUDE.md.
+        #
+        # Never silent: a dropped `sync` means reconnect resync is not happening,
+        # and staying quiet about exactly this is how #2279 ran undetected.
+        @config.logger&.warn(
+          "Featureflip: discarding malformed #{event_type} payload: #{e.message}"
+        )
+      rescue StandardError => e
+        # Other event-processing errors must not kill the stream thread, but they
+        # are still worth surfacing — this used to swallow silently.
+        @config.logger&.warn(
+          "Featureflip: error handling #{event_type} event: #{e.class}: #{e.message}"
+        )
       end
     end
   end

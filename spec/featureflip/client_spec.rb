@@ -281,6 +281,15 @@ RSpec.describe Featureflip::Client do
       expect(detail.reason).to eq("Error")
     end
 
+    # Ruby already guarded every variation accessor; initialized? was the one
+    # gap (#2287), so a closed handle correctly served defaults while still
+    # reporting itself initialized.
+    it "reports initialized? false after close" do
+      expect(client.initialized?).to be true
+      client.close
+      expect(client.initialized?).to be false
+    end
+
     it "double-close is idempotent" do
       expect { client.close }.not_to raise_error
       expect { client.close }.not_to raise_error

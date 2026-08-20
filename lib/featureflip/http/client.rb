@@ -79,11 +79,26 @@ module Featureflip
         request(method, path, body, retries: retries - 1)
       end
 
+      # Enum fields are strings on the wire. Ruby keeps whatever it is handed and the
+      # evaluator compares against string literals, so a non-string here is stored
+      # verbatim and then silently matches nothing forever — note `value || "And"`
+      # does NOT save us, because 0 is truthy in Ruby (#2285).
+      #
+      # Only the TYPE is checked. An unrecognised enum *string* is how a newer server
+      # introduces a new operator, and the evaluator already degrades that to
+      # no-match; rejecting it would break this SDK against every future server.
+      def require_enum_string!(value, field)
+        return value if value.nil? || value.is_a?(String)
+
+        raise MalformedPayloadError,
+          "#{field} must be a string, got #{value.class} (#{value.inspect})"
+      end
+
       def parse_flag(data)
         Models::FlagConfiguration.new(
           key: data["key"],
           version: data["version"],
-          type: data["type"],
+          type: require_enum_string!(data["type"], "flag.type"),
           enabled: data["enabled"],
           variations: (data["variations"] || []).map { |v| Models::Variation.new(key: v["key"], value: v["value"]) },
           rules: (data["rules"] || []).map { |r| parse_rule(r) },
@@ -114,7 +129,7 @@ module Featureflip
 
       def parse_condition_group(data)
         Models::ConditionGroup.new(
-          operator: data["operator"] || "And",
+          operator: require_enum_string!(data["operator"], "conditionGroup.operator") || "And",
           conditions: (data["conditions"] || []).map { |c| parse_condition(c) }
         )
       end
@@ -122,7 +137,7 @@ module Featureflip
       def parse_condition(data)
         Models::Condition.new(
           attribute: data["attribute"],
-          operator: data["operator"],
+          operator: require_enum_string!(data["operator"], "condition.operator"),
           values: data["values"],
           negate: data["negate"] || false
         )
@@ -134,7 +149,7 @@ module Featureflip
         end
 
         Models::ServeConfig.new(
-          type: data["type"],
+          type: require_enum_string!(data["type"], "serve.type"),
           variation: data["variation"],
           bucket_by: data["bucketBy"],
           salt: data["salt"],
@@ -147,7 +162,7 @@ module Featureflip
           key: data["key"],
           version: data["version"],
           conditions: (data["conditions"] || []).map { |c| parse_condition(c) },
-          condition_logic: data["conditionLogic"] || "And"
+          condition_logic: require_enum_string!(data["conditionLogic"], "segment.conditionLogic") || "And"
         )
       end
     end
