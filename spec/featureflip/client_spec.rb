@@ -382,6 +382,80 @@ RSpec.describe Featureflip::Client do
       end
     end
 
+    describe "event payload shape" do
+      def spy_on_events(client)
+        ep = client.instance_variable_get(:@core).instance_variable_get(:@event_processor)
+        allow(ep).to receive(:queue_event).and_call_original
+        ep
+      end
+
+      it "identify forwards the caller's attributes as metadata" do
+        ep = spy_on_events(client)
+
+        client.identify({ "user_id" => "user1", "email" => "a@b.co", "plan" => "pro" })
+
+        expect(ep).to have_received(:queue_event).with(
+          hash_including(metadata: { "email" => "a@b.co", "plan" => "pro" })
+        )
+      end
+
+      it "identify strips both identity spellings from metadata" do
+        ep = spy_on_events(client)
+
+        client.identify({ "user_id" => "user1", "userId" => "alias", "plan" => "pro" })
+
+        expect(ep).to have_received(:queue_event).with(
+          hash_including(userId: "user1", metadata: { "plan" => "pro" })
+        )
+      end
+
+      it "identify omits metadata when only the identity was supplied" do
+        ep = spy_on_events(client)
+
+        client.identify({ "user_id" => "user1" })
+
+        expect(ep).to have_received(:queue_event).with(hash_not_including(:metadata))
+      end
+
+      it "identify resolves the userId alias" do
+        ep = spy_on_events(client)
+
+        client.identify({ "userId" => "user1" })
+
+        expect(ep).to have_received(:queue_event).with(hash_including(userId: "user1"))
+      end
+
+      it "track resolves the userId alias" do
+        ep = spy_on_events(client)
+
+        client.track("purchase", { "userId" => "user1" })
+
+        expect(ep).to have_received(:queue_event).with(hash_including(userId: "user1"))
+      end
+
+      it "track omits metadata when none was supplied" do
+        ep = spy_on_events(client)
+
+        client.track("purchase", { "user_id" => "user1" })
+
+        expect(ep).to have_received(:queue_event).with(hash_not_including(:metadata))
+      end
+
+      it "does not raise into the host when metadata is not a collection" do
+        spy_on_events(client)
+
+        expect { client.track("purchase", { "user_id" => "user1" }, 5) }.not_to raise_error
+      end
+
+      it "omits userId entirely when the context carries no identity" do
+        ep = spy_on_events(client)
+
+        client.identify({ "plan" => "pro" })
+
+        expect(ep).to have_received(:queue_event).with(hash_not_including(:userId))
+      end
+    end
+
     describe "#variation_detail evaluation event" do
       it "queues event with PascalCase type and camelCase keys" do
         event_processor = client.instance_variable_get(:@core).instance_variable_get(:@event_processor)

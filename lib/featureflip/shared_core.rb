@@ -241,25 +241,29 @@ module Featureflip
       return unless @event_processor
 
       context = normalize_context(context)
-      @event_processor.queue_event({
+      @event_processor.queue_event(compact_event({
         type: "Custom",
         flagKey: event_key,
-        userId: context["user_id"]&.to_s,
-        metadata: metadata || {},
+        userId: resolve_event_user_id(context),
+        metadata: metadata,
         timestamp: Time.now.utc.iso8601
-      })
+      }))
     end
 
     def identify(context)
       return unless @event_processor
 
       context = normalize_context(context)
-      @event_processor.queue_event({
+      # Strip both identity spellings so the id is carried once, at the top
+      # level, and not duplicated inside the attribute bag.
+      attributes = context.reject { |k, _| IDENTITY_KEYS.include?(k) }
+      @event_processor.queue_event(compact_event({
         type: "Identify",
         flagKey: "$identify",
-        userId: context["user_id"]&.to_s,
+        userId: resolve_event_user_id(context),
+        metadata: attributes,
         timestamp: Time.now.utc.iso8601
-      })
+      }))
     end
 
     def flush
@@ -417,16 +421,43 @@ module Featureflip
       context.transform_keys(&:to_s)
     end
 
+    # Both spellings of the identity are accepted on an event context; the
+    # canonical +user_id+ wins when a caller supplies both. The evaluator
+    # already aliases these for bucketing, so events have to as well or an
+    # alias caller gets every event attributed to nil.
+    IDENTITY_KEYS = %w[user_id userId].freeze
+
+    def resolve_event_user_id(context)
+      raw = context["user_id"]
+      raw = context["userId"] if raw.nil?
+      raw&.to_s
+    end
+
+    # +userId+ and +metadata+ are optional on the wire. Omit them rather than
+    # sending nulls or empty bags, matching the other SDKs.
+    #
+    # +metadata+ is caller-supplied and untyped, so the emptiness check is
+    # guarded: a caller passing a non-collection must not take a NoMethodError
+    # into their request path just to record an analytics event.
+    def compact_event(event)
+      event.delete(:userId) if event[:userId].nil?
+      metadata = event[:metadata]
+      if metadata.nil? || (metadata.respond_to?(:empty?) && metadata.empty?)
+        event.delete(:metadata)
+      end
+      event
+    end
+
     def record_evaluation(key, context, variation_key)
       return unless @event_processor
 
-      @event_processor.queue_event({
+      @event_processor.queue_event(compact_event({
         type: "Evaluation",
         flagKey: key,
-        userId: context["user_id"]&.to_s,
+        userId: resolve_event_user_id(context),
         variation: variation_key,
         timestamp: Time.now.utc.iso8601
-      })
+      }))
     end
 
     # Fire the registered evaluation inspectors. Called once per variation call

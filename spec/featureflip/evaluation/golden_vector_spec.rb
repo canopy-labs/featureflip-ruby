@@ -160,8 +160,12 @@ RSpec.describe "golden vectors" do
   # Condition vectors
   # ---------------------------------------------------------------------------
 
-  describe "condition vectors" do
-    VECTORS["conditionVectors"].each do |v|
+  # Defines one example per vector. Shared by the engine-generated condition
+  # vectors and the hand-authored unknown-operator vectors, which have an
+  # identical input shape. Defined as a class method so nested example groups
+  # (RSpec subclasses) inherit it.
+  def self.condition_vector_examples(vectors)
+    vectors.each do |v|
       it "#{v["id"]}: condition match == #{v["expectedMatch"]}" do
         # Build a minimal two-variation flag with a single rule whose one
         # condition exercises the vector.  The attribute value is taken from the
@@ -208,6 +212,26 @@ RSpec.describe "golden vectors" do
         expect(got).to eq(v["expectedMatch"]), v["id"]
       end
     end
+  end
+
+  describe "condition vectors" do
+    condition_vector_examples(VECTORS["conditionVectors"])
+  end
+
+  # ---------------------------------------------------------------------------
+  # Unknown-operator vectors (#2262)
+  # ---------------------------------------------------------------------------
+  #
+  # Hand-authored, not engine-generated: the generator resolves operators with
+  # Enum.Parse<ConditionOperator>, which throws on an unrecognised name, so these
+  # cases cannot exist as conditionVectors. They lock the rule that an operator
+  # this SDK does not recognise means "cannot evaluate", NOT "did not match" — so
+  # `negate` must never invert it into a match-everyone, which would serve the
+  # flag to 100% of traffic. Ruby carries the operator as a raw string, so unlike
+  # the enum-typed SDKs it can genuinely receive one of these over the wire.
+
+  describe "unknown-operator vectors" do
+    condition_vector_examples(VECTORS["unknownOperatorVectors"])
   end
 
   # ---------------------------------------------------------------------------

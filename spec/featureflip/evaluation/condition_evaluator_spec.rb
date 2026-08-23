@@ -581,6 +581,41 @@ RSpec.describe Featureflip::Evaluation::ConditionEvaluator do
       end
     end
 
+    # Issue #2262: an operator this SDK does not recognise means "I cannot
+    # evaluate this", NOT "this did not match". Inverting that inability with
+    # `negate` would turn it into a match-everyone — the flag served to 100% of
+    # traffic. The realistic trigger is a new operator shipped server-side
+    # reaching an SDK pinned to an older version. Unrecognised operators fail
+    # CLOSED, before negate is applied.
+    #
+    # Contrast the missing-attribute context below, which legitimately returns
+    # `negate`: absence is a determinate fact about the user, whereas an
+    # unrecognised operator is not a fact about the user at all.
+    context "unrecognised operator" do
+      it "does not match when not negated" do
+        c = condition(operator: "SomeFutureOperator")
+        expect(evaluator.evaluate_condition(c, { "country" => "US" })).to be false
+      end
+
+      it "does not match when negated (fails closed, not open)" do
+        c = condition(operator: "SomeFutureOperator", negate: true)
+        expect(evaluator.evaluate_condition(c, { "country" => "US" })).to be false
+      end
+
+      # This evaluator matches operator labels exactly (PascalCase, as the API
+      # emits them), so a mis-cased label is simply unrecognised and must fail
+      # closed like any other rather than inverting into a match-everyone.
+      it "treats a mis-cased known operator as unrecognised, both ways" do
+        expect(evaluator.evaluate_condition(
+          condition(operator: "equals"), { "country" => "US" }
+        )).to be false
+
+        expect(evaluator.evaluate_condition(
+          condition(operator: "equals", negate: true), { "country" => "US" }
+        )).to be false
+      end
+    end
+
     context "missing attribute" do
       it "returns false when attribute is absent" do
         c = condition(operator: "Equals")

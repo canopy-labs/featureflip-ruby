@@ -32,6 +32,14 @@ module Featureflip
         targets = condition.values.map(&:to_s)
 
         result = evaluate_operator(condition.operator, str_value, targets)
+
+        # Issue #2262: an unrecognised operator fails CLOSED. `!nil` is `true`
+        # in Ruby, so without this guard a negated unknown operator would match
+        # every user and roll the flag out to 100% of traffic. The realistic
+        # trigger is a new operator shipped server-side reaching an SDK pinned
+        # to an older version.
+        return false if result.nil?
+
         condition.negate ? !result : result
       end
 
@@ -150,7 +158,10 @@ module Featureflip
         when "SemverLessThanOrEqual"
           targets.any? { |t| compare_semver(value, t, :<=) }
         else
-          false
+          # Unrecognised operator. `nil` — NOT `false` — so the caller can tell
+          # "cannot evaluate" apart from "evaluated, did not match"; only the
+          # latter may be inverted by `negate` (#2262).
+          nil
         end
       end
 

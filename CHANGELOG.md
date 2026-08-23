@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.5.1 — 2026-08-23
+
+### Fixed
+
+- An unrecognised condition operator now fails closed instead of matching every user. The default arm returned `false`, which a negated condition then inverted to `true` — so a config naming an operator the SDK did not know could silently target everyone. ([#2262](https://github.com/canopy-labs/featureflip/issues/2262))
+- `identify()` and `track()` put the same payload on the wire as every other server SDK. The field set and shapes had drifted per language, so the same call produced different events depending on which SDK sent it. ([#2359](https://github.com/canopy-labs/featureflip/issues/2359))
+
 ## 2.5.0 — 2026-08-20
 
 ### Fixed
