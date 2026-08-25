@@ -20,18 +20,37 @@ module Featureflip
       # connect-time `sync` SSE snapshot, which carries the identical payload
       # shape inline (no extra HTTP round-trip).
       def parse_flags_response(data)
-        flags = (data["flags"] || []).map { |f| parse_flag(f) }
-        segments = (data["segments"] || []).map { |s| parse_segment(s) }
+        flags = drop_unevaluable((data["flags"] || []).map { |f| parse_flag(f) }, "flag") do |flag|
+          unevaluable_flag_reason(flag)
+        end
+        segments = drop_unevaluable((data["segments"] || []).map { |s| parse_segment(s) }, "segment") do |segment|
+          unevaluable_segment_reason(segment)
+        end
         [flags, segments]
       end
 
       def get_flag(key)
         response = request(:get, "/v1/sdk/flags/#{key}")
-        parse_flag(JSON.parse(response.body))
+        flag = parse_flag(JSON.parse(response.body))
+
+        # An unevaluable enum drops the flag rather than upserting it (#2402). For a
+        # delta whose whole scope is one flag that means leaving the store's previous
+        # copy alone: replacing it with one this build would mis-evaluate is the outcome
+        # the drop exists to prevent, and FLAG_NOT_FOUND is the honest answer if there
+        # was no previous copy.
+        reason = unevaluable_flag_reason(flag)
+        raise UnevaluableEntityError, "flag #{key.inspect}: #{reason}" if reason
+
+        flag
       end
 
       def post_events(events)
-        request(:post, "/v1/sdk/events", { events: events })
+        # The one caller that retries inline. EventProcessor#flush drains the queue before
+        # sending, so a batch only survives a failure because the processor puts it back --
+        # this absorbs a single transient 5xx before that machinery is needed, which keeps
+        # the common blip off the re-queue path entirely. The processor's backoff gate is
+        # measured from the moment this finally gives up, not from the first attempt.
+        request(:post, "/v1/sdk/events", { events: events }, retry_server_errors: true)
       end
 
       def close
@@ -40,7 +59,13 @@ module Featureflip
 
       private
 
-      def request(method, path, body = nil, retries: 1)
+      # retry_server_errors: retry once on a 5xx. Off by default — the poller re-fetches
+      # every poll_interval and the streaming source reconnects with backoff, so for flag
+      # reads an inner retry buys nothing and doubles request volume against a dependency
+      # that is already failing (it also blocked for a second inside the init_timeout
+      # budget on cold start). eval-api answers 503 when it cannot reach the Management
+      # API, which is exactly the status this used to trip on.
+      def request(method, path, body = nil, retries: 1, retry_server_errors: false)
         uri = URI("#{@base_url}#{path}")
         http = Net::HTTP.new(uri.host, uri.port)
         http.use_ssl = uri.scheme == "https"
@@ -62,13 +87,16 @@ module Featureflip
 
         response = http.request(req)
 
-        if response.is_a?(Net::HTTPServerError) && retries > 0
+        if retry_server_errors && response.is_a?(Net::HTTPServerError) && retries > 0
           sleep(1)
-          return request(method, path, body, retries: retries - 1)
+          return request(method, path, body, retries: retries - 1, retry_server_errors: retry_server_errors)
         end
 
         unless response.is_a?(Net::HTTPSuccess)
-          raise Featureflip::Error, "HTTP #{response.code}: #{path}"
+          # HttpStatusError, not a bare Error: the events flush branches on the status to
+          # decide whether the batch is worth keeping (#2456). Same message and same
+          # ancestry, so nothing that rescues Featureflip::Error changes behaviour.
+          raise HttpStatusError.new(response.code.to_i, path)
         end
 
         response
@@ -76,7 +104,7 @@ module Featureflip
              Net::OpenTimeout, Net::ReadTimeout => e
         raise if retries <= 0
         sleep(1)
-        request(method, path, body, retries: retries - 1)
+        request(method, path, body, retries: retries - 1, retry_server_errors: retry_server_errors)
       end
 
       # Enum fields are strings on the wire. Ruby keeps whatever it is handed and the
@@ -164,6 +192,88 @@ module Featureflip
           conditions: (data["conditions"] || []).map { |c| parse_condition(c) },
           condition_logic: require_enum_string!(data["conditionLogic"], "segment.conditionLogic") || "And"
         )
+      end
+
+      # Entity-level drop for enum values this SDK build cannot evaluate (#2402).
+      #
+      # `serve.type` and `conditionLogic` are the two enums that are BOTH carried on the
+      # wire as strings AND consulted by the evaluator, and each dispatches on a two-way
+      # branch with no third arm:
+      #
+      #   serve.type == "Fixed" ... else ROLLOUT
+      #   logic      == "And"   ... else ANY (OR)
+      #
+      # So an unrecognised value does not fail — it takes the ELSE arm. A segment
+      # carrying conditionLogic "Xor" evaluates as OR, so a segment meant to require ALL
+      # of its conditions matches ANY of them: the rule fails OPEN and over-targets.
+      #
+      # Neither obvious fix works. Tolerating the value — as an unknown flag.type is
+      # tolerated — IS that silent mis-evaluation; flag.type is safe to tolerate only
+      # because nothing evaluates it. Raising MalformedPayloadError would discard the
+      # whole payload, so one additive server change takes down every flag on a pinned
+      # client (the #2372/#2395 outage shape).
+      #
+      # So the containing entity goes instead. Dropping a segment leaves rules pointing
+      # at it dangling, which is safe: Evaluation::Evaluator already treats an
+      # unresolvable segment_key as no-match (#1459), so the cascade fails CLOSED. The
+      # engine-generated `f-segment-unresolvable` golden vector pins that.
+      #
+      # Scoped deliberately to a NON-EMPTY unrecognised value. An absent field already
+      # defaults to "And" above, and the missing-required-field axis is a separate
+      # concern that the SDKs deliberately disagree on; checking only values that are
+      # present and unrecognised keeps this change purely additive.
+      SERVE_TYPES = ["Fixed", "Rollout"].freeze
+      CONDITION_LOGIC = ["And", "Or"].freeze
+
+      def drop_unevaluable(entities, kind)
+        entities.reject do |entity|
+          reason = yield(entity)
+          next false unless reason
+
+          @config.logger&.warn(
+            "Featureflip: dropping #{kind} #{entity.key.inspect}: #{reason}. This SDK " \
+            "version may be older than the flag configuration; the rest of the " \
+            "configuration was applied."
+          )
+          true
+        end
+      end
+
+      # Why this flag cannot be evaluated, or nil if it can. A reason rather than a
+      # boolean so the diagnostic can name the field and the value actually received.
+      def unevaluable_flag_reason(flag)
+        reason = unevaluable_serve_reason(flag.fallthrough, "fallthrough")
+        return reason if reason
+
+        (flag.rules || []).each do |rule|
+          reason = unevaluable_serve_reason(rule.serve, "rule[#{rule.id}].serve")
+          return reason if reason
+
+          (rule.condition_groups || []).each do |group|
+            next if group.operator.nil? || group.operator.empty?
+            next if CONDITION_LOGIC.include?(group.operator)
+
+            return "rule[#{rule.id}].conditionGroup.operator #{group.operator.inspect} " \
+                   "is not a condition logic this SDK version understands"
+          end
+        end
+
+        nil
+      end
+
+      # Why this segment cannot be evaluated, or nil if it can.
+      def unevaluable_segment_reason(segment)
+        logic = segment.condition_logic
+        return nil if logic.nil? || logic.empty? || CONDITION_LOGIC.include?(logic)
+
+        "conditionLogic #{logic.inspect} is not a condition logic this SDK version understands"
+      end
+
+      def unevaluable_serve_reason(serve, path)
+        type = serve&.type
+        return nil if type.nil? || type.empty? || SERVE_TYPES.include?(type)
+
+        "#{path}.type #{type.inspect} is not a serve type this SDK version understands"
       end
     end
   end

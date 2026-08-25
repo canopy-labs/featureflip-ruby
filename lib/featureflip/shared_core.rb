@@ -386,7 +386,10 @@ module Featureflip
       @event_processor = Events::EventProcessor.new(
         @http_client,
         flush_interval: @config.flush_interval,
-        flush_batch_size: @config.flush_batch_size
+        flush_batch_size: @config.flush_batch_size,
+        # A dropped or re-queued batch must be visible: this fix keeps analytics that the
+        # edge briefly rejects, and it must not also hide the rejections themselves.
+        logger: @config.logger
       )
       @event_processor.start
     end

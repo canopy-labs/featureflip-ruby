@@ -234,6 +234,15 @@ module Featureflip
           flags, segments = @http_client.parse_flags_response(JSON.parse(data))
           @on_sync&.call(flags, segments)
         end
+      rescue UnevaluableEntityError => e
+        # Not a malformed payload: the frame was well-formed and simply described
+        # behaviour this build cannot evaluate, so the entity was dropped rather than
+        # the payload discarded (#2402). Logged at the same volume — a flag that
+        # silently stopped updating is exactly as confusing as one that never arrived.
+        @config.logger&.warn(
+          "Featureflip: dropping #{event_type} update: #{e.message}. This SDK version " \
+          "may be older than the flag configuration."
+        )
       rescue MalformedPayloadError => e
         # A payload that violates the wire contract is discarded WHOLESALE rather
         # than partially applied — a half-parsed snapshot silently mis-evaluates

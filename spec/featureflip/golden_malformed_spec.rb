@@ -62,6 +62,24 @@ RSpec.describe "golden malformedConfigVectors" do
         expect(applied).to be(true), "#{label}: forward-compatible payload was rejected"
         accepted = store.get_flag("mc-accepted-flag") || store.get_segment("mc-accepted")
         expect(accepted).not_to be_nil, "#{label}: accepted payload did not apply"
+      when "dropEntity"
+        # Neither accept nor reject: the payload APPLIES, minus the entities carrying
+        # an enum this build cannot evaluate. Both halves are asserted — "dropped"
+        # alone is satisfied by rejecting the whole payload, and "kept" alone by
+        # tolerating the bad value.
+        expect(applied).to be(true), "#{label}: payload was rejected wholesale"
+        v.fetch("dropFlags", []).each do |key|
+          expect(store.get_flag(key)).to be_nil, "#{label}: flag #{key} should have been dropped"
+        end
+        v.fetch("dropSegments", []).each do |key|
+          expect(store.get_segment(key)).to be_nil, "#{label}: segment #{key} should have been dropped"
+        end
+        v.fetch("keepFlags", []).each do |key|
+          expect(store.get_flag(key)).not_to be_nil, "#{label}: flag #{key} should have been kept"
+        end
+        v.fetch("keepSegments", []).each do |key|
+          expect(store.get_segment(key)).not_to be_nil, "#{label}: segment #{key} should have been kept"
+        end
       else
         raise "unmapped expect #{v.fetch('expect').inspect}"
       end

@@ -74,16 +74,32 @@ module Featureflip
       SemverVersion = Struct.new(:release, :prerelease)
       private_constant :SemverVersion
 
-      # An ISO-8601 date-time with no timezone offset (no trailing "Z"/±hh:mm),
-      # so it must be assumed UTC before parsing.
-      ISO_NO_OFFSET = /\A\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2})?(\.\d+)?\z/
-      private_constant :ISO_NO_OFFSET
+      # The ONLY characters trimmed from a date operand, and the whole of the
+      # operand's permitted whitespace: U+0009..U+000D plus U+0020 -- exactly the
+      # class the engine's NumberStyles.Integer accepts via AllowLeadingWhite |
+      # AllowTrailingWhite.
+      #
+      # String#strip is deliberately NOT used: it also strips NUL, so "\0005" was
+      # trimmed to "5" and matched here while the engine rejected it (#2468).
+      OPERAND_WHITESPACE = "\t\n\v\f\r "
+      private_constant :OPERAND_WHITESPACE
 
-      # A bare ISO-8601 calendar date ("2024-01-01") with no time component. The
-      # engine's DateTimeOffset.TryParse accepts these (midnight, assumed UTC),
-      # but Time.iso8601 rejects them, so they need their own midnight-UTC path.
-      ISO_DATE_ONLY = /\A\d{4}-\d{2}-\d{2}\z/
-      private_constant :ISO_DATE_ONLY
+      # Characters no date operand may contain: a NUL or other control character, or
+      # a non-ASCII whitespace/format character. An interior ASCII space is allowed
+      # -- it is the ISO-8601 date/time separator.
+      FORBIDDEN_OPERAND_CHAR =
+        /[\u0000-\u001f\u007f-\u009f\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]/
+      private_constant :FORBIDDEN_OPERAND_CHAR
+
+      # The ISO-8601 grammar a date operand may use: a calendar date, optionally
+      # followed by a time (seconds and fractional seconds optional) and an optional
+      # offset in either extended (+05:00 / Z) or basic (+0500) form. The separator
+      # may be "T" or a space -- the engine accepts both, but Time.iso8601 rejects
+      # the space, which is why ruby alone read "2024-01-01 00:00:00" as no-match
+      # (#2468).
+      ISO_OPERAND =
+        /\A(\d{4}-\d{2}-\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?(\.\d+)?(Z|[+-]\d{2}:?\d{2})?)?\z/
+      private_constant :ISO_OPERAND
 
       def evaluate_operator(operator, value, targets)
         # Case-insensitive views for the string/relational/date operators.
@@ -220,31 +236,87 @@ module Featureflip
       # TryParseDateTime. ISO-8601 strings honor any timezone offset; a string
       # without an offset is assumed UTC. A bare integer is treated as Unix time
       # in seconds. Returns nil when the input parses as neither.
-      def parse_datetime(value)
-        s = value.to_s.strip
+      # DateTimeOffset.MinValue / MaxValue as unix seconds -- the exact bounds the
+      # engine's FromUnixTimeSeconds accepts before throwing (#2432).
+      MIN_UNIX_SECONDS = -62_135_596_800
+      MAX_UNIX_SECONDS = 253_402_300_799
 
-        begin
-          # `Time.iso8601` honors offsets/"Z" but raises on a no-offset string;
-          # append the missing time/offset to assume midnight UTC for bare dates
-          # and UTC for offset-less date-times (mirroring DateTimeOffset.TryParse
-          # with AssumeUniversal).
-          iso =
-            if s.match?(ISO_DATE_ONLY)
-              "#{s}T00:00:00Z"
-            elsif s.match?(ISO_NO_OFFSET)
-              "#{s}Z"
-            else
-              s
-            end
-          return Time.iso8601(iso).utc
-        rescue ArgumentError
-          # Fall through to the Unix-seconds fallback.
+      # Rewrites an accepted ISO operand into the strict extended form Time.iso8601
+      # parses: "T" separator, seconds present, offset spelled "+HH:MM" or "Z".
+      # Returns nil when the operand is not an accepted ISO shape.
+      def canonicalize_iso(s)
+        m = ISO_OPERAND.match(s)
+        return nil if m.nil?
+
+        date, hh, mm, ss, frac, off = m.captures
+        return "#{date}T00:00:00Z" if hh.nil?
+
+        # The engine's DateTimeOffset.TryParse rejects hour 24 outright rather than
+        # rolling it over to 00:00 the next day, which is what Time.iso8601 does.
+        return nil if hh >= "24"
+
+        ss ||= "00"
+        off =
+          if off.nil? then "Z"
+          elsif off.length == 5 && off != "Z" then "#{off[0, 3]}:#{off[3, 2]}"
+          else off
+          end
+        "#{date}T#{hh}:#{mm}:#{ss}#{frac}#{off}"
+      end
+
+      def parse_datetime(value)
+        s = value.to_s
+        # Trim exactly the engine's whitespace class, then reject anything still
+        # carrying a character no operand may contain.
+        s = s.gsub(/\A[#{Regexp.escape(OPERAND_WHITESPACE)}]+|[#{Regexp.escape(OPERAND_WHITESPACE)}]+\z/, "")
+        return nil if s.empty? || s.match?(FORBIDDEN_OPERAND_CHAR)
+
+        iso = canonicalize_iso(s)
+        if iso
+          begin
+            # Offset-less forms were canonicalized to an explicit "Z", mirroring
+            # DateTimeOffset.TryParse with AssumeUniversal.
+            return Time.iso8601(iso).utc
+          rescue ArgumentError
+            # A syntactically-valid but non-existent date (e.g. 2024-02-31) --
+            # fall through to the Unix-seconds fallback, which will also reject it.
+          end
         end
 
         # Integer fallback: treat a bare integer as Unix time in seconds.
-        if s.match?(/\A-?\d+\z/)
+        #
+        # Out-of-range seconds match NOTHING rather than resolving to a far-future
+        # instant: the engine's FromUnixTimeSeconds throws outside DateTimeOffset's
+        # range and TryParseDateTime returns false. Ruby's Time has a far wider range
+        # and would happily accept the value, so the bound has to be explicit. The
+        # case that matters in practice is a MILLISECONDS timestamp pasted where
+        # seconds belong, which would otherwise land in the year 55829 and satisfy
+        # every `After` comparison (#2432).
+        #
+        # The sign class matches the engine's `long.TryParse` with
+        # `NumberStyles.Integer` (`AllowLeadingWhite | AllowTrailingWhite |
+        # AllowLeadingSign`), so a leading "+" is accepted deliberately rather than
+        # incidentally, and `Integer()` reads it the same way. Omitting it made "+5"
+        # an unparseable string matching NOTHING here while the engine and four other
+        # SDKs read it as five seconds past the epoch (#2458).
+        #
+        # The whitespace flags now match too: the trim above is exactly
+        # `AllowLeadingWhite`/`AllowTrailingWhite`'s class, and anything outside it
+        # was already rejected by FORBIDDEN_OPERAND_CHAR (#2468).
+        if s.match?(/\A[+-]?\d+\z/)
           begin
-            return Time.at(Integer(s)).utc
+            # Base 10 EXPLICITLY. Bare `Integer(s)` honours Ruby's literal base
+            # prefixes, so a leading zero means OCTAL: "0500" became 320 rather than
+            # 500, and "0800" raised ArgumentError (8 is not an octal digit) and
+            # matched nothing at all. Every other implementation parses base 10 --
+            # the engine's `long.TryParse`, go's `ParseInt(s, 10, 64)`, java's
+            # `Long.parseLong`, python's `int()`, php's `(int)` cast and js's
+            # `Number()` -- so ruby was alone in reading a zero-padded unix timestamp
+            # as a different instant. Pinned by `c-date-unix-leading-zero-*` (#2458).
+            seconds = Integer(s, 10)
+            return nil if seconds < MIN_UNIX_SECONDS || seconds > MAX_UNIX_SECONDS
+
+            return Time.at(seconds).utc
           rescue RangeError, ArgumentError
             return nil
           end

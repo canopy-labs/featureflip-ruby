@@ -1,5 +1,35 @@
 # Changelog
 
+## 2.6.1 — 2026-08-24
+
+### Fixed
+
+- A date operand is now trimmed of exactly the whitespace the evaluation engine trims (tab, newline, vertical tab, form feed, carriage return and space), and is rejected outright if it still carries a NUL, another control character, or a non-ASCII whitespace character. Each SDK had been relying on its own language's `trim`, and no two of those cover the same set, so the same operand could match on one SDK and match nothing on another. ([#2468](https://github.com/canopy-labs/featureflip/issues/2468))
+- A date operand written with a space separator (`2024-01-01 00:00:00`), without seconds (`2024-01-01T00:00`), or with a basic offset (`+0500`) now parses. `Time.iso8601` rejects all three, so they were matching nothing here while the engine accepted them. ([#2468](https://github.com/canopy-labs/featureflip/issues/2468))
+- An ISO-8601 operand naming hour 24 (`2024-01-01T24:00:00`) matches nothing, rather than rolling over to the next day. ([#2468](https://github.com/canopy-labs/featureflip/issues/2468))
+
+## 2.6.0 — 2026-08-24
+
+### Fixed
+
+- Analytics events survive a failed send instead of being discarded. The queue was drained before the POST and the batch dropped on any failure, so every rejection cost that batch permanently — and the production edge answers this endpoint with a 503 at a low but constant rate, so the loss was steady rather than exceptional. A batch that fails for a reason a later attempt could get past — any 5xx, a 429, or a transport error or timeout — now goes back to the front of the queue and the next flush re-sends it. One the server will reject identically forever — 401/403 for a rejected SDK key, 400 for a malformed body — is still dropped, but now says so. Every failure is logged either way, so this does not hide the rejections it recovers from. ([#2456](https://github.com/canopy-labs/featureflip/issues/2456))
+
+### Added
+
+- The event queue is bounded, at 10,000 events by default. Past the bound the oldest events are shed and the number dropped is logged, so an endpoint that stays down cannot grow the buffer without limit. ([#2456](https://github.com/canopy-labs/featureflip/issues/2456))
+
+### Changed
+
+- `flush` sends at most `flush_batch_size` events per request instead of posting the whole queue in one. That only mattered once failed batches started being kept: a sustained outage can leave the queue sitting at its 10,000-event bound, and a body that large risks an outright rejection — which, being non-retryable, would have dropped the entire backlog through the very path meant to preserve it. A batch the server rejects permanently is dropped and the drain moves on to the events behind it, so one bad batch cannot block the backlog. ([#2456](https://github.com/canopy-labs/featureflip/issues/2456))
+
+- A re-queued batch no longer makes every subsequent tracked event trigger its own send. Keeping a failed batch leaves the queue at or above `flush_batch_size`, which would otherwise turn a failing endpoint into one request per evaluation. The batch-size trigger now stands down for one `flush_interval` after a retryable failure, and only one size-triggered flush runs at a time; the background flush thread remains the retry vehicle. ([#2456](https://github.com/canopy-labs/featureflip/issues/2456))
+
+## 2.5.2 — 2026-08-23
+
+### Fixed
+
+- A failed flag fetch no longer costs two requests. `get_flags` retried once on a 5xx before raising, which doubled request volume against a backend that was already failing and blocked for a second inside the `init_timeout` budget on cold start. The poller re-fetches every `poll_interval` and the streaming source reconnects with backoff, so the inner retry added nothing. Event delivery keeps its retry — `EventProcessor#flush` clears the queue before sending, so a dropped batch is unrecoverable. ([#2454](https://github.com/canopy-labs/featureflip/issues/2454))
+
 ## 2.5.1 — 2026-08-23
 
 ### Fixed
