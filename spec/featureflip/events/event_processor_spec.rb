@@ -441,3 +441,136 @@ RSpec.describe Featureflip::Events::EventProcessor do
     end
   end
 end
+
+# A hand-rolled stub rather than instance_double: these specs park a thread
+# INSIDE post_events while another thread calls flush, and rspec-mocks records
+# every message through a proxy that is not safe to enter from two threads at
+# once — the parked call deadlocks the spec rather than failing it.
+class ConcurrencyProbeClient
+  def initialize
+    @mutex = Mutex.new
+    @gate = Queue.new
+    @arrived = Queue.new
+    @in_flight = 0
+    @peak = 0
+    @sent = 0
+    @parked = false
+  end
+
+  def post_events(_events)
+    held = false
+    @mutex.synchronize do
+      @in_flight += 1
+      @peak = [@peak, @in_flight].max
+      # Only the very FIRST request is parked. Re-parking a later one would wait
+      # on a gate nothing pushes to again and hang the spec.
+      held = !@parked
+      @parked = true
+    end
+
+    if held
+      @arrived << :arrived
+      @gate.pop
+    end
+
+    @mutex.synchronize do
+      @in_flight -= 1
+      @sent += 1
+    end
+    nil
+  end
+
+  # The greatest number of requests ever in flight at the same moment. That
+  # maximum is the whole point: the drain loop is what must not run twice at
+  # once, and the only externally visible evidence of a second drain is a second
+  # request arriving while the first is still unanswered.
+  def peak
+    @mutex.synchronize { @peak }
+  end
+
+  def sent
+    @mutex.synchronize { @sent }
+  end
+
+  def await_first_request
+    @arrived.pop
+  end
+
+  def release
+    @gate << :go
+  end
+end
+
+RSpec.describe Featureflip::Events::EventProcessor, "flush coalescing" do
+  let(:logger) { instance_double(Logger, warn: nil, info: nil, debug: nil) }
+  let(:http_client) { ConcurrencyProbeClient.new }
+
+  # Batch size 1 so a seeded queue needs one round-trip per event: plenty of room
+  # for a second loop to interleave if one is allowed to start. Seeded directly
+  # rather than through #queue_event, because at this batch size every call would
+  # fire the size trigger and start a drain of its own — the spec would be parked
+  # in setup before it had started either flush.
+  def seeded_processor(count)
+    processor = described_class.new(http_client, flush_interval: 3600, flush_batch_size: 1, logger: logger)
+    queue = processor.instance_variable_get(:@queue)
+    count.times { |i| queue << { type: "eval", key: "flag-#{i}" } }
+    processor
+  end
+
+  # A second flush must not open its own drain loop while one is already running.
+  #
+  # Two concurrent drains mean two request streams against the endpoint the
+  # backoff gate exists to protect, and — the sharper problem — a success in one
+  # clears the gate a failure in the other has just armed (#2477).
+  it "runs only one drain loop when two threads flush at once" do
+    processor = seeded_processor(6)
+
+    first = Thread.new { processor.flush }
+    # The first request is parked inside the client, so the drain loop is
+    # provably mid-flight and anything arriving next came from a second one.
+    http_client.await_first_request
+
+    released = false
+    second_saw_release = nil
+    second = Thread.new do
+      processor.flush
+      second_saw_release = released
+    end
+
+    # Room for the second caller to misbehave: uncoalesced it shifts a batch off
+    # the front and posts it, which the peak counter catches.
+    sleep(0.2)
+
+    released = true
+    http_client.release
+    first.join(5)
+    second.join(5)
+
+    expect(http_client.peak).to eq(1)
+    # A caller that asked for a flush is asking for its events to be sent, so it
+    # waits for the drain rather than returning early. Matches the js/node SDKs.
+    expect(second_saw_release).to be(true)
+    expect(processor.instance_variable_get(:@queue)).to be_empty
+  end
+
+  # #stop is the last drain there will ever be, so it must bypass coalescing:
+  # waiting for an in-flight drain and returning would discard the queue unsent.
+  it "still drains from stop while a flush is in flight" do
+    processor = seeded_processor(2)
+
+    first = Thread.new { processor.flush }
+    http_client.await_first_request
+
+    # Released as stop runs, so stop genuinely overlaps the in-flight drain
+    # rather than waiting it out first.
+    Thread.new do
+      sleep(0.1)
+      http_client.release
+    end
+
+    processor.stop
+    first.join(5)
+
+    expect(http_client.sent).to eq(2)
+  end
+end

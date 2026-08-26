@@ -357,4 +357,38 @@ RSpec.describe Featureflip::DataSource::StreamingHandler do
       writer&.close
     end
   end
+
+  describe "#backoff_delay jitters every level (#2508)" do
+    # The drops this backoff absorbs are fleet-wide: one edge event severs every
+    # stream at once (#2457 — measured at a 2.5-3.0ms spread across both eval-api
+    # pods), so every client re-enters the backoff at failures == 0 together. A
+    # constant there republishes the drop's own synchronisation as a reconnect
+    # spike one base delay later.
+    let(:handler) { build_handler }
+    let(:base) { described_class::RECONNECT_BASE_DELAY_SECONDS }
+
+    it "scatters the first reconnect instead of returning a constant" do
+      samples = 200.times.flat_map { |_| [0, 1].map { |f| handler.send(:backoff_delay, f) } }.uniq
+
+      expect(samples.size).to be > 1,
+        "first-reconnect delay is deterministic (#{samples.size} distinct value(s)) — " \
+        "a fleet-wide drop reconnects in lockstep"
+    end
+
+    it "keeps the first reconnect inside [base/2, base] and strictly positive" do
+      200.times do
+        [0, 1].each do |failures|
+          delay = handler.send(:backoff_delay, failures)
+          expect(delay).to be_between(base / 2.0, base)
+          expect(delay).to be > 0 # anti-busy-loop on a clean EOF
+        end
+      end
+    end
+
+    it "still escalates and caps, each level jittered" do
+      expect(handler.send(:backoff_delay, 2)).to be_between(base, base * 2)
+      expect(handler.send(:backoff_delay, 50))
+        .to be_between(described_class::MAX_BACKOFF_SECONDS / 2.0, described_class::MAX_BACKOFF_SECONDS)
+    end
+  end
 end

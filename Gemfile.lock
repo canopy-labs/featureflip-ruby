@@ -1,7 +1,7 @@
 PATH
   remote: .
   specs:
-    featureflip (2.6.1)
+    featureflip (2.7.0)
       logger
 
 GEM
@@ -9,7 +9,7 @@ GEM
   specs:
     addressable (2.9.0)
       public_suffix (>= 2.0.2, < 8.0)
-    bigdecimal (4.0.1)
+    bigdecimal (4.1.2)
     crack (1.0.1)
       bigdecimal
       rexml
@@ -32,7 +32,7 @@ GEM
       rspec-support (~> 3.13.0)
     rspec-support (3.13.7)
     simplecov (1.1.1)
-    webmock (3.26.2)
+    webmock (3.26.3)
       addressable (>= 2.8.0)
       crack (>= 0.3.2)
       hashdiff (>= 0.4.0, < 2.0.0)

@@ -101,6 +101,10 @@ module Featureflip
         /\A(\d{4}-\d{2}-\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?(\.\d+)?(Z|[+-]\d{2}:?\d{2})?)?\z/
       private_constant :ISO_OPERAND
 
+      # Length of each month in a non-leap year, indexed 1..12. Index 0 is unused padding.
+      DAYS_IN_MONTH = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31].freeze
+      private_constant :DAYS_IN_MONTH
+
       def evaluate_operator(operator, value, targets)
         # Case-insensitive views for the string/relational/date operators.
         ci_value = value.downcase
@@ -232,14 +236,41 @@ module Featureflip
         left.send(op, right)
       end
 
-      # Parses a date-time to a UTC `Time`, mirroring the engine's
-      # TryParseDateTime. ISO-8601 strings honor any timezone offset; a string
-      # without an offset is assumed UTC. A bare integer is treated as Unix time
-      # in seconds. Returns nil when the input parses as neither.
       # DateTimeOffset.MinValue / MaxValue as unix seconds -- the exact bounds the
       # engine's FromUnixTimeSeconds accepts before throwing (#2432).
       MIN_UNIX_SECONDS = -62_135_596_800
       MAX_UNIX_SECONDS = 253_402_300_799
+
+      # Whether +date+ -- always "YYYY-MM-DD", since only canonicalize_iso calls this --
+      # names a day that exists.
+      #
+      # ISO_OPERAND matches the SHAPE of a calendar date and a character class cannot
+      # express "is a real day", so "2024-02-30", "2023-02-29" and "2024-04-31" all pass
+      # the grammar. The engine, csharp, go, python and java then reject them at parse;
+      # ruby, js and php ROLLED THEM OVER into the 1st of the following month, so one
+      # saved rule served different variations to two users purely by which SDK their
+      # service ran (#2491).
+      #
+      # Hand-rolled rather than delegated to Date.valid_date?, which applies the Italian
+      # calendar reform by DEFAULT and so rejects 1582-10-05..14 -- dates the engine
+      # resolves normally. Passing Date::GREGORIAN would fix that, but computing the
+      # arithmetic identically in ruby, js and php is what keeps the accepted set a
+      # property of THIS contract rather than of three separate calendars.
+      #
+      # Proleptic Gregorian, matching the engine: the leap rule applies at every year
+      # rather than from a reform date onward.
+      def real_calendar_day?(date)
+        year = date[0, 4].to_i
+        month = date[5, 2].to_i
+        day = date[8, 2].to_i
+
+        # Month 0 and day 0 are the shapes only php mishandled, rolling each BACKWARDS
+        # into the previous year ("2024-00-01" -> 2023-12-01, "2024-01-00" -> 2023-12-31).
+        return false if month < 1 || month > 12 || day < 1
+
+        leap_day = month == 2 && year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) ? 1 : 0
+        day <= DAYS_IN_MONTH[month] + leap_day
+      end
 
       # Rewrites an accepted ISO operand into the strict extended form Time.iso8601
       # parses: "T" separator, seconds present, offset spelled "+HH:MM" or "Z".
@@ -249,6 +280,12 @@ module Featureflip
         return nil if m.nil?
 
         date, hh, mm, ss, frac, off = m.captures
+
+        # Checked on the WRITTEN date, before any offset is applied. Validating the
+        # resolved UTC components instead would accept "2024-02-30T00:00:00+05:00",
+        # which lands on 2024-02-29T19:00Z -- a date that does exist.
+        return nil unless real_calendar_day?(date)
+
         return "#{date}T00:00:00Z" if hh.nil?
 
         # The engine's DateTimeOffset.TryParse rejects hour 24 outright rather than
@@ -264,6 +301,10 @@ module Featureflip
         "#{date}T#{hh}:#{mm}:#{ss}#{frac}#{off}"
       end
 
+      # Parses a date-time to a UTC `Time`, mirroring the engine's
+      # TryParseDateTime. ISO-8601 strings honor any timezone offset; a string
+      # without an offset is assumed UTC. A bare integer is treated as Unix time
+      # in seconds. Returns nil when the input parses as neither.
       def parse_datetime(value)
         s = value.to_s
         # Trim exactly the engine's whitespace class, then reject anything still
@@ -276,10 +317,35 @@ module Featureflip
           begin
             # Offset-less forms were canonicalized to an explicit "Z", mirroring
             # DateTimeOffset.TryParse with AssumeUniversal.
-            return Time.iso8601(iso).utc
+            t = Time.iso8601(iso).utc
+
+            # The SAME range the integer branch below enforces, applied to the
+            # RESOLVED instant. The engine parses with DateTimeOffset.TryParse, so its
+            # accepted set is bounded by DateTimeOffset's range and it returns false
+            # outside it; ruby, js, php, go and java all resolve past both ends --
+            # year 0 to a real instant, and a 4-digit year plus an offset to one
+            # beyond either bound (#2500).
+            #
+            # Checked on the RESOLVED instant, deliberately unlike the WRITTEN-triple
+            # check in real_calendar_day?. The two answer different questions: whether
+            # the operand names a real DAY is a property of what was written
+            # ("2024-02-30T00:00:00+05:00" lands on a real UTC day but names none),
+            # whereas whether it is REPRESENTABLE is a property of what it resolves to
+            # -- the offset is exactly what carries "0001-01-01T00:00:00+05:00" under
+            # the floor and "9999-12-31T23:59:59-05:00" over the ceiling.
+            #
+            # to_i floors, matching the other SDKs: a fractional second is always a
+            # non-negative addend, so "0000-12-31T23:59:59.5Z" floors to MIN-1 and is
+            # rejected while "0001-01-01T00:00:00.5Z" floors to MIN and is kept.
+            seconds = t.to_i
+            return nil if seconds < MIN_UNIX_SECONDS || seconds > MAX_UNIX_SECONDS
+
+            return t
           rescue ArgumentError
-            # A syntactically-valid but non-existent date (e.g. 2024-02-31) --
-            # fall through to the Unix-seconds fallback, which will also reject it.
+            # An unreal day is already gone (real_calendar_day?), so this now only
+            # catches the out-of-range minute and second the grammar's \d{2} still
+            # admits ("00:99", "00:00:99"), which every other SDK rejects too. Falls
+            # through to the Unix-seconds fallback, which rejects a non-integer.
           end
         end
 

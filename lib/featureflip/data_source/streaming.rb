@@ -195,11 +195,27 @@ module Featureflip
         end
       end
 
-      # Capped exponential backoff. failures == 0 means a healthy stream just
-      # closed cleanly; still apply the base floor so we don't busy-loop.
+      # Capped exponential backoff, jittered at every level. failures == 0 means a
+      # healthy stream just closed cleanly; the jitter band's lower bound keeps the
+      # base floor in force so we don't busy-loop.
+      #
+      # Jittering the FIRST reconnect is load-bearing, not cosmetic: the drops this
+      # absorbs are fleet-wide — one edge event severs every stream at once (#2457)
+      # — so every client re-enters here at failures == 0 together. A constant there
+      # replayed the drop's own synchronisation as a reconnect spike one base delay
+      # later (#2508).
       def backoff_delay(failures)
         exponent = failures <= 0 ? 0 : failures - 1
-        [RECONNECT_BASE_DELAY_SECONDS * (2**exponent), MAX_BACKOFF_SECONDS].min
+        with_jitter([RECONNECT_BASE_DELAY_SECONDS * (2**exponent), MAX_BACKOFF_SECONDS].min)
+      end
+
+      # Returns a value in [d/2, d] to de-correlate reconnects across many SDK
+      # instances (thundering-herd avoidance after a shared outage).
+      def with_jitter(delay)
+        return delay if delay <= 0
+
+        half = delay / 2.0
+        half + (rand * half)
       end
 
       # Sleep for `seconds`, but return immediately if stop() fires — so a pending

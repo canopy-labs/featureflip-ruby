@@ -34,6 +34,22 @@ module Featureflip
         # — see #auto_flush.
         @next_auto_flush_at = 0.0
         @auto_flush_in_flight = false
+
+        # Coalescing state for the drain loop. @auto_flush_in_flight above only ever
+        # guarded the SIZE trigger; nothing stopped the background thread's interval
+        # tick, an explicit Client#flush and a size-triggered flush from entering the
+        # loop together. Two concurrent drains mean two request streams against the
+        # endpoint the backoff gate exists to protect — and a success in one clears
+        # the gate a failure in the other has just armed, re-opening the
+        # one-request-per-event behaviour outright (#2477).
+        #
+        # Generation counters rather than a bare flag: a waiter has to be able to
+        # tell "the drain I was waiting for has finished" from "a later drain is
+        # running", or it would sleep through its own completion.
+        @drain_in_flight = false
+        @drain_started = 0
+        @drain_finished = 0
+        @drain_done = ConditionVariable.new
       end
 
       def queue_event(event)
@@ -58,7 +74,43 @@ module Featureflip
       # at its 10,000-event bound, and posting all of that at once risks a body the server
       # rejects outright. A 413 is non-retryable, so the entire backlog would be dropped by
       # the very path added to preserve it.
+      # At most one drain runs at a time. A caller arriving while one is already
+      # going waits for it and returns — it does NOT start its own, and it does NOT
+      # return early, because a caller that asked for a flush is asking for its
+      # events to be sent. This matches the js/node SDKs, whose flush() has always
+      # returned the in-flight promise (#2477).
       def flush
+        mine = @mutex.synchronize do
+          if @drain_in_flight
+            nil
+          else
+            @drain_in_flight = true
+            @drain_started += 1
+          end
+        end
+
+        if mine.nil?
+          @mutex.synchronize do
+            waiting_for = @drain_started
+            @drain_done.wait(@mutex) while @drain_finished < waiting_for
+          end
+          return
+        end
+
+        begin
+          drain
+        ensure
+          @mutex.synchronize do
+            @drain_in_flight = false
+            @drain_finished = mine
+            @drain_done.broadcast
+          end
+        end
+      end
+
+      # The drain loop itself, callable when coalescing must be bypassed.
+      # Private: #flush is the public entry point, and #stop reaches this directly.
+      private def drain
         loop do
           batch = drain_batch
           return if batch.empty?
@@ -103,7 +155,13 @@ module Featureflip
         # re-queued: nothing will flush again, and retrying until the queue drains would
         # hang shutdown for as long as the endpoint stayed down. One attempt, then let go.
         @mutex.synchronize { @stopped = true }
-        flush
+        # drain, not flush: shutdown must never be the call that gets coalesced
+        # away. If the interval tick's drain happens to be in flight, flush would
+        # wait for it and return, and anything queued after that loop's last look
+        # would be discarded unsent. Two drains overlapping is safe here precisely
+        # because @stopped is already set, so neither can re-queue and there is no
+        # backoff left to disarm.
+        drain
         @mutex.synchronize { @queue.clear }
       end
 
