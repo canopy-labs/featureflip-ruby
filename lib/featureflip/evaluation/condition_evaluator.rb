@@ -14,14 +14,19 @@ module Featureflip
 
         return condition.negate if attr_value.nil?
 
+        # Resolve the operator ONCE (#2374). Every subsequent decision that keys
+        # off it -- numeric coercion, dispatch -- must read the same normalised
+        # label, or a mis-cased operator takes some paths and not others.
+        operator = normalize_operator(condition.operator)
+
         # Issue #1458: when the attribute is a native numeric (Integer/Float —
         # Ruby's `true`/`false` are NOT Numeric, so booleans are naturally
         # excluded), the equality-family operators coerce the condition values to
         # numbers and compare numerically, so 1.0 matches "1". This mirrors the
         # engine's type-aware path and runs BEFORE stringification — a String
         # attribute (even "1.0") stays on the string path below.
-        if attr_value.is_a?(Numeric) && NUMERIC_EQUALITY_OPERATORS.include?(condition.operator)
-          return evaluate_numeric_equality(condition, attr_value)
+        if attr_value.is_a?(Numeric) && NUMERIC_EQUALITY_OPERATORS.include?(operator)
+          return evaluate_numeric_equality(condition, operator, attr_value)
         end
 
         # Pass the raw (case-preserved) strings to the operator dispatcher.
@@ -31,7 +36,7 @@ module Featureflip
         str_value = attr_value.to_s
         targets = condition.values.map(&:to_s)
 
-        result = evaluate_operator(condition.operator, str_value, targets)
+        result = evaluate_operator(operator, str_value, targets)
 
         # Issue #2262: an unrecognised operator fails CLOSED. `!nil` is `true`
         # in Ruby, so without this guard a negated unknown operator would match
@@ -66,7 +71,7 @@ module Featureflip
       # The equality-family operators that get type-aware numeric coercion when
       # the attribute is a native Numeric (Issue #1458). Relational/string ops
       # are deliberately excluded — only these four coerce.
-      NUMERIC_EQUALITY_OPERATORS = %w[Equals NotEquals In NotIn].freeze
+      NUMERIC_EQUALITY_OPERATORS = %w[equals notequals in notin].freeze
       private_constant :NUMERIC_EQUALITY_OPERATORS
 
       # A parsed semantic version: the release core as dot-separated numeric
@@ -105,29 +110,47 @@ module Featureflip
       DAYS_IN_MONTH = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31].freeze
       private_constant :DAYS_IN_MONTH
 
+      # The single definition of "recognised operator" shared by the four
+      # string-typed SDKs (js, go, ruby, php) -- see #2374. Strips underscores
+      # and folds case, so the canonical PascalCase the API emits ("NotEquals"),
+      # the concatenated form go accepted ("notequals", "NOTEQUALS") and the
+      # snake_case form php accepted ("not_equals") all resolve to one label.
+      #
+      # This SDK previously matched the PascalCase labels EXACTLY, so every
+      # mis-cased spelling was simply unknown and failed closed. Normalising by
+      # removal makes the shared rule a superset of what each SDK accepted
+      # before, so no SDK gets stricter and no configuration that evaluated
+      # before stops doing so. The concatenated labels stay unambiguous under
+      # this mapping -- no two operator names collide once underscores go.
+      def normalize_operator(operator)
+        operator.to_s.delete("_").downcase
+      end
+
+      # `operator` arrives already normalised, so the labels below are the
+      # concatenated lowercase form rather than the wire PascalCase.
       def evaluate_operator(operator, value, targets)
         # Case-insensitive views for the string/relational/date operators.
         ci_value = value.downcase
         ci_targets = targets.map(&:downcase)
 
         case operator
-        when "Equals"
+        when "equals"
           ci_targets.any? { |t| ci_value == t }
-        when "NotEquals"
+        when "notequals"
           ci_targets.all? { |t| ci_value != t }
-        when "Contains"
+        when "contains"
           ci_targets.any? { |t| ci_value.include?(t) }
-        when "NotContains"
+        when "notcontains"
           ci_targets.all? { |t| !ci_value.include?(t) }
-        when "StartsWith"
+        when "startswith"
           ci_targets.any? { |t| ci_value.start_with?(t) }
-        when "EndsWith"
+        when "endswith"
           ci_targets.any? { |t| ci_value.end_with?(t) }
-        when "In"
+        when "in"
           ci_targets.include?(ci_value)
-        when "NotIn"
+        when "notin"
           !ci_targets.include?(ci_value)
-        when "MatchesRegex"
+        when "matchesregex"
           # Case-sensitive matching on the original-case value and pattern,
           # mirroring the engine (RegexOptions.None). Case-insensitivity is
           # opt-in via the (?i) inline flag in the pattern.
@@ -145,13 +168,13 @@ module Featureflip
         # against ANY condition value (mirroring the server engine), not just
         # values[0]. `.any?` over an empty array is false, so empty values
         # returns false without error.
-        when "GreaterThan"
+        when "greaterthan"
           ci_targets.any? { |t| compare_numeric(ci_value, t, :>) }
-        when "GreaterThanOrEqual"
+        when "greaterthanorequal"
           ci_targets.any? { |t| compare_numeric(ci_value, t, :>=) }
-        when "LessThan"
+        when "lessthan"
           ci_targets.any? { |t| compare_numeric(ci_value, t, :<) }
-        when "LessThanOrEqual"
+        when "lessthanorequal"
           ci_targets.any? { |t| compare_numeric(ci_value, t, :<=) }
         # Date operators compare against the RAW value/targets, not the
         # lowercased copies: downcasing breaks ISO-8601 parsing (the "Z" UTC
@@ -159,23 +182,23 @@ module Featureflip
         # to UTC instants — offsets are honored, no-offset strings are assumed
         # UTC, and a bare integer is treated as Unix seconds — so an unparseable
         # operand matches nothing instead of falling back to a string compare.
-        when "Before"
+        when "before"
           targets.any? { |t| compare_datetime(value, t, :<) }
-        when "After"
+        when "after"
           targets.any? { |t| compare_datetime(value, t, :>) }
         # Semantic-version operators compare against the RAW value/targets:
         # prerelease precedence is case-sensitive (semver §11), so the casing
         # preserved by `evaluate_condition` must not be folded here. An
         # unparseable version matches nothing, like the numeric/date operators.
-        when "SemverEquals"
+        when "semverequals"
           targets.any? { |t| compare_semver(value, t, :==) }
-        when "SemverGreaterThan"
+        when "semvergreaterthan"
           targets.any? { |t| compare_semver(value, t, :>) }
-        when "SemverGreaterThanOrEqual"
+        when "semvergreaterthanorequal"
           targets.any? { |t| compare_semver(value, t, :>=) }
-        when "SemverLessThan"
+        when "semverlessthan"
           targets.any? { |t| compare_semver(value, t, :<) }
-        when "SemverLessThanOrEqual"
+        when "semverlessthanorequal"
           targets.any? { |t| compare_semver(value, t, :<=) }
         else
           # Unrecognised operator. `nil` — NOT `false` — so the caller can tell
@@ -190,21 +213,21 @@ module Featureflip
       # numerically against the attribute. Equals/In match if ANY value is equal;
       # NotEquals/NotIn are their negation. The `negate` flag is then applied,
       # mirroring `evaluate_condition`'s tail.
-      def evaluate_numeric_equality(condition, attr_value)
+      def evaluate_numeric_equality(condition, operator, attr_value)
         target = attr_value.to_f
         any_equal = condition.values.any? do |v|
           n = parse_numeric(v)
           n && n == target
         end
 
-        positive = NUMERIC_EQUALITY_POSITIVE_OPERATORS.include?(condition.operator)
+        positive = NUMERIC_EQUALITY_POSITIVE_OPERATORS.include?(operator)
         result = positive ? any_equal : !any_equal
         condition.negate ? !result : result
       end
 
       # Equals/In are the "positive" members of the equality family (match on
       # equality); NotEquals/NotIn negate the same any-equal test.
-      NUMERIC_EQUALITY_POSITIVE_OPERATORS = %w[Equals In].freeze
+      NUMERIC_EQUALITY_POSITIVE_OPERATORS = %w[equals in].freeze
       private_constant :NUMERIC_EQUALITY_POSITIVE_OPERATORS
 
       # Strict literal parse of a condition value to a Float, reusing the same

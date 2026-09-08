@@ -602,16 +602,59 @@ RSpec.describe Featureflip::Evaluation::ConditionEvaluator do
         expect(evaluator.evaluate_condition(c, { "country" => "US" })).to be false
       end
 
-      # This evaluator matches operator labels exactly (PascalCase, as the API
-      # emits them), so a mis-cased label is simply unrecognised and must fail
-      # closed like any other rather than inverting into a match-everyone.
-      it "treats a mis-cased known operator as unrecognised, both ways" do
+      # Issue #2374: a MIS-CASED label is not an unknown operator. Underscores
+      # are stripped and case folded before dispatch, so every spelling of a
+      # known operator resolves to the same one — the shared definition js, go,
+      # ruby and php now agree on. Only a name that is not an operator at all
+      # reaches the fail-closed path asserted above.
+      {
+        "equals"     => ["US", true],
+        "EQUALS"     => ["US", true],
+        "notequals"  => ["CA", true],
+        "not_equals" => ["CA", true],
+        "NOTEQUALS"  => ["CA", true],
+        "NOT_EQUALS" => ["CA", true]
+      }.each do |operator, (value, expected)|
+        it "resolves mis-cased #{operator} to the known operator" do
+          c = condition(operator: operator, values: [value])
+          expect(evaluator.evaluate_condition(c, { "country" => "US" })).to be expected
+        end
+      end
+
+      # The fail-closed rule of #2262 governs UNKNOWN operators. Once an
+      # operator resolves, `negate` inverts it normally — so the `false` below
+      # is a match that was inverted, not the fail-closed answer it used to be.
+      it "applies negate normally to a resolved mis-cased operator" do
         expect(evaluator.evaluate_condition(
-          condition(operator: "equals"), { "country" => "US" }
+          condition(operator: "equals", negate: true), { "country" => "US" }
         )).to be false
 
         expect(evaluator.evaluate_condition(
-          condition(operator: "equals", negate: true), { "country" => "US" }
+          condition(operator: "equals", values: ["CA"], negate: true), { "country" => "US" }
+        )).to be true
+      end
+
+      # Resolution must not lose the operator's case-sensitivity class: the
+      # semver and regex arms read the RAW operands, so a mis-cased spelling
+      # has to reach the same arm as the canonical one.
+      it "keeps a mis-cased case-sensitive operator case-sensitive" do
+        expect(evaluator.evaluate_condition(
+          condition(operator: "matchesregex", attribute: "name", values: ["^abc$"]),
+          { "name" => "ABC" }
+        )).to be false
+
+        expect(evaluator.evaluate_condition(
+          condition(operator: "matchesregex", attribute: "name", values: ["^ABC$"]),
+          { "name" => "ABC" }
+        )).to be true
+      end
+
+      # Same hazard on the numeric-coercion lookup: a mis-cased equality
+      # operator that skipped it would compare "1" against "1.0" lexically.
+      it "keeps a mis-cased equality operator on the numeric path" do
+        expect(evaluator.evaluate_condition(
+          condition(operator: "not_equals", attribute: "age", values: ["1.0"]),
+          { "age" => 1 }
         )).to be false
       end
     end
