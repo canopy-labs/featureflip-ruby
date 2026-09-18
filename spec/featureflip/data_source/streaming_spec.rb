@@ -32,7 +32,8 @@ RSpec.describe Featureflip::DataSource::StreamingHandler do
   let(:on_segment_updated) { instance_double(Proc) }
   let(:on_error) { instance_double(Proc) }
   let(:on_sync) { instance_double(Proc) }
-  let(:on_give_up) { instance_double(Proc) }
+  let(:on_fallback_to_polling) { instance_double(Proc) }
+  let(:on_recovered) { instance_double(Proc) }
   let(:handler) do
     described_class.new(
       sdk_key: sdk_key,
@@ -285,15 +286,17 @@ RSpec.describe Featureflip::DataSource::StreamingHandler do
   end
 
   describe "#run backs off on clean EOF and escalates without an error (#1893)" do
-    it "reconnects with backoff after each clean EOF and escalates to give-up" do
-      local = build_handler(on_give_up: on_give_up)
-      allow(on_give_up).to receive(:call)
+    it "reconnects with backoff after each clean EOF and escalates to the polling fallback" do
+      local = build_handler(on_fallback_to_polling: on_fallback_to_polling)
+      allow(on_fallback_to_polling).to receive(:call)
       allow(on_error).to receive(:call)
 
       calls = 0
       allow(local).to receive(:connect) do
         calls += 1
-        raise "runaway reconnect loop (no backoff)" if calls > 100
+        # The fallback is additive (#3071), so run() no longer returns on its own —
+        # stop it well past the threshold to prove it kept reconnecting.
+        local.instance_variable_set(:@stop_flag, true) if calls >= 20
         false # 200, clean EOF, zero frames delivered — must NOT reset retry_count
       end
       backoffs = []
@@ -301,15 +304,17 @@ RSpec.describe Featureflip::DataSource::StreamingHandler do
 
       local.send(:run)
 
-      expect(on_give_up).to have_received(:call).once  # accumulated to the fallback threshold
-      expect(on_error).not_to have_received(:call)     # a clean EOF is not an error
-      expect(backoffs).not_to be_empty                 # backed off between reconnects
-      expect(backoffs).to all(be > 0)                  # never a zero-delay busy-loop
+      expect(on_fallback_to_polling).to have_received(:call).once # armed once, not once per failure
+      expect(calls).to be >= 20                         # kept reconnecting past max_stream_retries (5)
+      expect(on_error).not_to have_received(:call)      # a clean EOF is not an error
+      expect(backoffs).not_to be_empty                  # backed off between reconnects
+      expect(backoffs).to all(be > 0)                   # never a zero-delay busy-loop
+      expect(backoffs.max).to be <= described_class::MAX_BACKOFF_SECONDS # capped, not unbounded
     end
 
     it "resets the failure counter when a delivered stream drops via exception (watchdog/reset)" do
-      local = build_handler(on_give_up: on_give_up)
-      allow(on_give_up).to receive(:call)
+      local = build_handler(on_fallback_to_polling: on_fallback_to_polling)
+      allow(on_fallback_to_polling).to receive(:call)
       allow(on_error).to receive(:call)
       allow(local).to receive(:backoff_wait)
 
@@ -328,7 +333,49 @@ RSpec.describe Featureflip::DataSource::StreamingHandler do
       local.send(:run)
 
       expect(attempts).to be >= 10                # ran well past max_stream_retries (5)
-      expect(on_give_up).not_to have_received(:call)
+      expect(on_fallback_to_polling).not_to have_received(:call)
+    end
+  end
+
+  describe "the polling fallback is additive, and the stream retires it on recovery (#3071)" do
+    it "signals recovery on the first frame delivered after the fallback armed" do
+      local = build_handler(
+        on_fallback_to_polling: on_fallback_to_polling,
+        on_recovered: on_recovered
+      )
+      allow(on_fallback_to_polling).to receive(:call)
+      allow(on_recovered).to receive(:call)
+      allow(on_sync).to receive(:call)
+      allow(http_client).to receive(:parse_flags_response).and_return([[], []])
+
+      # Arm the fallback the way five failed reconnects would.
+      local.instance_variable_set(:@fallback_active, true)
+
+      local.send(:process_sse_line, "event: sync")
+      local.send(:process_sse_line, "data: {\"flags\":[],\"segments\":[]}")
+      local.send(:process_sse_line, "")
+
+      expect(on_recovered).to have_received(:call).once
+
+      # A healthy stream's later frames are not further recoveries.
+      local.send(:process_sse_line, "event: sync")
+      local.send(:process_sse_line, "data: {\"flags\":[],\"segments\":[]}")
+      local.send(:process_sse_line, "")
+
+      expect(on_recovered).to have_received(:call).once
+    end
+
+    it "does not signal recovery on a stream that never fell back" do
+      local = build_handler(on_recovered: on_recovered)
+      allow(on_recovered).to receive(:call)
+      allow(on_sync).to receive(:call)
+      allow(http_client).to receive(:parse_flags_response).and_return([[], []])
+
+      local.send(:process_sse_line, "event: sync")
+      local.send(:process_sse_line, "data: {\"flags\":[],\"segments\":[]}")
+      local.send(:process_sse_line, "")
+
+      expect(on_recovered).not_to have_received(:call)
     end
   end
 

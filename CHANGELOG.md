@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.9.0 — 2026-09-18
+
+### Fixed
+
+- The polling fallback no longer ends the SSE stream. After `max_stream_retries` (5) consecutive failures — about 31 seconds of unreachability, so an edge incident, a bad deploy or a network partition — the streaming thread called `on_give_up` and exited, and the core cleared its handler, so nothing could ever restart streaming: the process lost real-time updates until it was restarted (or `Featureflip.restart` was called by hand for fork-safety) and polled `/v1/sdk/flags` every 30 seconds indefinitely. Flag changes, kill switches included, then arrived up to a poll interval late. Polling is now additive — it covers the outage while the stream keeps retrying underneath at the capped, jittered backoff, and the next delivered frame retires the poller. The poller is retired from the frame-delivery path rather than when the stream next drops, because a healthy stream blocks in its read loop for its whole lifetime and a poller left running beside it reverts SSE deltas with its own whole-store replaces. (#3071)
+
 ## 2.8.0 — 2026-09-01
 
 ### Fixed

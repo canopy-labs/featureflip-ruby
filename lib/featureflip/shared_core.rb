@@ -276,6 +276,11 @@ module Featureflip
       @streaming_handler&.stop
       @polling_handler&.stop
       @event_processor&.stop
+      # Clear both before restarting: start_polling refuses to start a second
+      # poller while one is referenced, so a stopped-but-referenced handler here
+      # would leave a restarted non-streaming core with no data source at all.
+      @streaming_handler = nil
+      @polling_handler = nil
 
       if @config.streaming
         start_streaming
@@ -361,18 +366,35 @@ module Featureflip
         on_segment_updated: ->(flags, segments) { @store.init(flags, segments) },
         on_sync: ->(flags, segments) { @store.init(flags, segments) },
         on_error: ->(_err) { },
-        on_give_up: -> { fallback_to_polling }
+        on_fallback_to_polling: -> { fallback_to_polling },
+        on_recovered: -> { stop_fallback_polling }
       )
       @streaming_handler.start
     end
 
     def fallback_to_polling
-      @config.logger&.warn("Featureflip: streaming retries exhausted, falling back to polling")
-      @streaming_handler = nil
+      @config.logger&.warn(
+        "Featureflip: streaming retries exhausted, falling back to polling while the stream keeps retrying"
+      )
+      # The handler is NOT cleared: it is still running and still trying to reopen
+      # the stream (#3071). Clearing it here is what used to make the fallback
+      # permanent — nothing would have restarted streaming.
       start_polling
     end
 
+    def stop_fallback_polling
+      return if @polling_handler.nil?
+
+      @config.logger&.info("Featureflip: stream recovered, stopping polling fallback")
+      @polling_handler.stop
+      @polling_handler = nil
+    end
+
     def start_polling
+      # Reachable from both start_data_source and the streaming fallback; a second
+      # call must not leak a second polling thread.
+      return if @polling_handler
+
       @polling_handler = DataSource::PollingHandler.new(
         http_client: @http_client,
         config: @config,

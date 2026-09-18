@@ -36,7 +36,7 @@ module Featureflip
       RECONNECT_BASE_DELAY_SECONDS = 1
       MAX_BACKOFF_SECONDS = 30
 
-      def initialize(sdk_key:, config:, http_client:, on_flag_updated:, on_flag_deleted:, on_segment_updated:, on_error:, on_sync: nil, on_give_up: nil)
+      def initialize(sdk_key:, config:, http_client:, on_flag_updated:, on_flag_deleted:, on_segment_updated:, on_error:, on_sync: nil, on_fallback_to_polling: nil, on_recovered: nil)
         @sdk_key = sdk_key
         @config = config
         @http_client = http_client
@@ -45,10 +45,14 @@ module Featureflip
         @on_segment_updated = on_segment_updated
         @on_error = on_error
         @on_sync = on_sync
-        @on_give_up = on_give_up
+        @on_fallback_to_polling = on_fallback_to_polling
+        @on_recovered = on_recovered
         @stop_flag = false
         @thread = nil
         @retry_count = 0
+        # True between arming the polling fallback and the next delivered frame.
+        # Only ever touched from the streaming thread.
+        @fallback_active = false
         @current_event_type = nil
         @current_data = nil
         @line_buffer = String.new # ASCII-8BIT: raw read_body bytes concatenate safely
@@ -60,6 +64,7 @@ module Featureflip
       def start
         @stop_flag = false
         @retry_count = 0
+        @fallback_active = false
         @thread = Thread.new { run }
       end
 
@@ -112,9 +117,14 @@ module Featureflip
             # purposes — otherwise an accept-then-close server never accumulates
             # toward max_stream_retries and never degrades to polling.
             @retry_count += 1
-            if @retry_count > @config.max_stream_retries
-              @on_give_up&.call
-              break
+            # The fallback is ADDITIVE, never terminal (#3071). Polling covers the
+            # outage; this loop keeps retrying the stream underneath at the capped
+            # backoff, and the next delivered frame retires the poller. Breaking out
+            # here left the process polling — and blind to real-time updates — until
+            # it restarted, after only ~31s of unreachability.
+            if @retry_count > @config.max_stream_retries && !@fallback_active
+              @fallback_active = true
+              @on_fallback_to_polling&.call
             end
           end
 
@@ -189,6 +199,14 @@ module Featureflip
           @current_data = @current_data.nil? ? fragment : "#{@current_data}\n#{fragment}"
         elsif line.empty? && @current_event_type && @current_data
           @delivered_frame = true
+          # Retire the fallback poller HERE rather than when run() next comes round:
+          # connect() blocks in read_body for the whole lifetime of a healthy stream,
+          # so a reap on return would leave the poller alive that entire time, and its
+          # periodic whole-store replaces would revert deltas applied by this stream.
+          if @fallback_active
+            @fallback_active = false
+            @on_recovered&.call
+          end
           handle_event(@current_event_type, @current_data)
           @current_event_type = nil
           @current_data = nil
