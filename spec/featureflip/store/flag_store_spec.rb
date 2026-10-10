@@ -138,4 +138,63 @@ RSpec.describe Featureflip::Store::FlagStore do
       end
     end
   end
+
+  describe "change reporting" do
+    def with_prereq(flag, prereq_key)
+      flag.dup.tap do |f|
+        f.prerequisites = [Featureflip::Models::Prerequisite.new(prerequisite_flag_key: prereq_key, expected_variation_key: "true")]
+      end
+    end
+
+    it "reports nothing for the first snapshot (the baseline)" do
+      expect(store.init([make_flag(key: "a")], [])).to eq([])
+    end
+
+    it "reports nothing when a later snapshot is identical" do
+      store.init([make_flag(key: "a")], [make_segment(key: "s")])
+      expect(store.init([make_flag(key: "a")], [make_segment(key: "s")])).to eq([])
+    end
+
+    it "reports the diff for a later snapshot" do
+      store.init([make_flag(key: "a"), make_flag(key: "b")], [])
+      expect(store.init([make_flag(key: "a", enabled: false), make_flag(key: "c")], [])).to eq(%w[a b c])
+    end
+
+    it "reports an upsert that changes the flag, with its dependents" do
+      store.init([make_flag(key: "p"), with_prereq(make_flag(key: "child"), "p")], [])
+      expect(store.upsert(make_flag(key: "p", version: 2, enabled: false))).to eq(%w[child p])
+    end
+
+    it "reports nothing for an identical redelivery" do
+      store.init([make_flag(key: "a")], [])
+      expect(store.upsert(make_flag(key: "a"))).to eq([])
+    end
+
+    it "reports nothing for an equal-version redelivery of identical config" do
+      store.init([make_flag(key: "a", version: 5)], [])
+      expect(store.upsert(make_flag(key: "a", version: 5))).to eq([])
+    end
+
+    it "applies and reports an equal-version upsert with different content" do
+      store.init([make_flag(key: "a", version: 5)], [])
+      expect(store.upsert(make_flag(key: "a", version: 5, enabled: false))).to eq(%w[a])
+      expect(store.get_flag("a").enabled).to be(false)
+    end
+
+    it "reports nothing when an older version is rejected" do
+      store.init([make_flag(key: "a", version: 5)], [])
+      expect(store.upsert(make_flag(key: "a", version: 4, enabled: false))).to eq([])
+      expect(store.get_flag("a").enabled).to be(true)
+    end
+
+    it "reports a delete with the dependents that still reference it" do
+      store.init([make_flag(key: "p"), with_prereq(make_flag(key: "child"), "p")], [])
+      expect(store.remove_flag("p")).to eq(%w[child p])
+    end
+
+    it "reports nothing when deleting an absent flag" do
+      store.init([make_flag(key: "a")], [])
+      expect(store.remove_flag("missing")).to eq([])
+    end
+  end
 end

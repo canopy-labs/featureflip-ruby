@@ -269,6 +269,48 @@ RSpec.describe Featureflip::DataSource::StreamingHandler do
     end
   end
 
+  describe "a listener that stops the handler mid-chunk (#3643)" do
+    # Records which chunks the reader actually pulled, so the spec can tell
+    # "stopped reading" from "read everything and found nothing to do".
+    class RecordingSseResponse < FakeChunkedSseResponse
+      attr_reader :pulled
+
+      def initialize(chunks)
+        super
+        @pulled = 0
+      end
+
+      def read_body(&block)
+        @chunks.each do |chunk|
+          @pulled += 1
+          block.call(chunk)
+        end
+      end
+    end
+
+    it "leaves the read loop without waiting for another chunk and dispatches no buffered line" do
+      updated = []
+      holder = {}
+      on_updated = lambda do |flag|
+        updated << flag
+        holder[:handler].stop # what close/restart from an on_update listener does
+      end
+      local = build_handler(on_flag_updated: on_updated)
+      holder[:handler] = local
+      allow(http_client).to receive(:get_flag) { |key| key }
+
+      first = "event: flag.updated\ndata: {\"key\":\"a\"}\n\n" \
+              "event: flag.updated\ndata: {\"key\":\"b\"}\n\n"
+      response = RecordingSseResponse.new([first, "event: ping\n\n", "event: ping\n\n"])
+      stub_streaming_connection(response)
+
+      local.send(:connect)
+
+      expect(updated).to eq(["a"]) # "b" was already buffered but must not be dispatched
+      expect(response.pulled).to eq(1) # and no second chunk was requested
+    end
+  end
+
   describe "#connect signals whether the stream delivered a frame (#1893)" do
     it "returns false when the stream returns 200 then EOFs without any frame" do
       stub_streaming_connection(FakeChunkedSseResponse.new([]))

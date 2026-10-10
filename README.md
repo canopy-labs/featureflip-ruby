@@ -123,6 +123,20 @@ detail.rule_id        # Rule ID if reason is "RuleMatch"
 detail.variation_key  # Key of the matched variation
 ```
 
+### Reacting to flag changes
+
+```ruby
+unsubscribe = client.on_update do |changed_keys|
+  Rails.logger.info("flags changed: #{changed_keys.join(', ')}")
+end
+
+unsubscribe.call # stop listening
+```
+
+The block runs on the SDK's streaming or polling thread, so keep it short. Hand
+real work to a queue. The initial flag load does not fire; only later changes
+do. Closing the client drops its subscriptions.
+
 ## Event Tracking
 
 ```ruby
@@ -135,6 +149,8 @@ client.identify({ user_id: "123", email: "user@example.com", plan: "pro" })
 # Force flush pending events
 client.flush
 ```
+
+Featureflip counts each event name, per environment. The metadata you pass is transmitted with the event but is not stored, and event counts are not surfaced in the app or API.
 
 ## Testing
 

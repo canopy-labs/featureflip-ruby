@@ -8,6 +8,7 @@ require_relative "featureflip/models/evaluation_event"
 require_relative "featureflip/evaluation/bucketing"
 require_relative "featureflip/evaluation/condition_evaluator"
 require_relative "featureflip/evaluation/evaluator"
+require_relative "featureflip/store/update_diff"
 require_relative "featureflip/store/flag_store"
 require_relative "featureflip/http/client"
 require_relative "featureflip/events/event"
@@ -83,6 +84,11 @@ module Featureflip
     def restart
       ensure_configured!
       @default_client.restart
+    end
+
+    def on_update(listener = nil, &block)
+      ensure_configured!
+      @default_client.on_update(listener, &block)
     end
 
     private

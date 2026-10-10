@@ -17,9 +17,14 @@ module Featureflip
 
       def stop
         @stop_flag = true
-        @thread&.wakeup rescue nil
-        @thread&.join(5)
+        thread = @thread
         @thread = nil
+        # Called from a listener running on the poll thread: it can't join itself,
+        # and the stop flag ends its loop once the listener returns.
+        return if thread.nil? || thread.equal?(Thread.current)
+
+        thread.wakeup rescue nil
+        thread.join(5)
       end
 
       private

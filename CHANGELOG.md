@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.10.0 — 2026-10-09
+
+### Added
+
+- `Client#on_update` (and `Featureflip.on_update`) subscribes to flag-configuration changes. The listener receives the keys whose configuration changed, batched into one call per update: flags added, removed or modified, plus flags that reference an edited segment and flags depending on a changed flag through a prerequisite, whose evaluated value moves even though their own configuration did not. The initial load does not fire, and neither does an identical poll or a redelivered SSE event, so the hook reports changes rather than traffic. A raising listener is logged and isolated. The call returns an unsubscribe callable, and closing a handle drops every subscription that handle made without touching other handles on the same SDK key. This brings Ruby to parity with the Python, Java, Go and JavaScript SDKs. (#3643)
+
 ## 2.9.0 — 2026-09-18
 
 ### Fixed

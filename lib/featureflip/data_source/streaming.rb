@@ -77,6 +77,13 @@ module Featureflip
         @thread = nil
         return unless thread
 
+        # Called from a listener running ON the stream thread (close/restart from
+        # inside an on_update callback): raising into ourselves would fire
+        # StreamStopped synchronously mid-shutdown and joining ourselves would
+        # deadlock. The flag is set, so the read loop abandons the connection as soon
+        # as the listener returns.
+        return if thread.equal?(Thread.current)
+
         # Interrupt a thread blocked in read_body. Guard the raise: the thread may
         # finish between the alive? check and the raise (ThreadError on a dead one).
         begin
@@ -163,7 +170,12 @@ module Featureflip
           reset_stream_parser
           response.read_body do |chunk|
             break if @stop_flag
+
             feed_chunk(chunk)
+            # A listener on this thread may have stopped the handler while
+            # feed_chunk dispatched. Leave read_body now, which abandons the SSE
+            # connection, instead of blocking on the socket for the next chunk.
+            break if @stop_flag
           end
         end
 
@@ -183,6 +195,8 @@ module Featureflip
       def feed_chunk(chunk)
         @line_buffer << chunk
         while (newline_index = @line_buffer.index("\n"))
+          break if @stop_flag
+
           line = @line_buffer.slice!(0, newline_index + 1)
           process_sse_line(line.chomp.force_encoding(Encoding::UTF_8))
         end

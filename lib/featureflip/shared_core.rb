@@ -97,6 +97,8 @@ module Featureflip
       @ref_count = 1
       @ref_mutex = Mutex.new
       @shut_down = false
+      @update_listeners = []
+      @update_listeners_mutex = Mutex.new
 
       bootstrap!
     end
@@ -124,6 +126,17 @@ module Featureflip
 
     def _config
       @config
+    end
+
+    # Internal: Client#on_update's registry. Listeners are core-wide (one data
+    # source feeds every handle); Client tracks which ones each handle added so
+    # closing one handle never silences another's.
+    def _add_update_listener(listener)
+      @update_listeners_mutex.synchronize { @update_listeners << listener }
+    end
+
+    def _remove_update_listener(listener)
+      @update_listeners_mutex.synchronize { @update_listeners.delete_if { |l| l.equal?(listener) } }
     end
 
     def _ref_count
@@ -361,10 +374,10 @@ module Featureflip
         sdk_key: @sdk_key,
         config: @config,
         http_client: @http_client,
-        on_flag_updated: ->(flag) { @store.upsert(flag) },
-        on_flag_deleted: ->(key) { @store.remove_flag(key) },
-        on_segment_updated: ->(flags, segments) { @store.init(flags, segments) },
-        on_sync: ->(flags, segments) { @store.init(flags, segments) },
+        on_flag_updated: ->(flag) { apply_flag_update(flag) },
+        on_flag_deleted: ->(key) { apply_flag_delete(key) },
+        on_segment_updated: ->(flags, segments) { apply_snapshot(flags, segments) },
+        on_sync: ->(flags, segments) { apply_snapshot(flags, segments) },
         on_error: ->(_err) { },
         on_fallback_to_polling: -> { fallback_to_polling },
         on_recovered: -> { stop_fallback_polling }
@@ -398,7 +411,7 @@ module Featureflip
       @polling_handler = DataSource::PollingHandler.new(
         http_client: @http_client,
         config: @config,
-        on_update: ->(flags, segments) { @store.init(flags, segments) },
+        on_update: ->(flags, segments) { apply_snapshot(flags, segments) },
         on_error: ->(_err) { }
       )
       @polling_handler.start
@@ -439,6 +452,41 @@ module Featureflip
 
     def get_segment(key)
       @store.get_segment(key)
+    end
+
+    # Every data-source write funnels through one of these three so the change
+    # set is computed by the store and reported in one place.
+    def apply_snapshot(flags, segments)
+      notify_update_listeners(@store.init(flags, segments))
+    end
+
+    def apply_flag_update(flag)
+      notify_update_listeners(@store.upsert(flag))
+    end
+
+    def apply_flag_delete(key)
+      notify_update_listeners(@store.remove_flag(key))
+    end
+
+    # Runs on the streaming/polling thread, OUTSIDE the store lock: listeners are
+    # user code and may re-enter the client. Isolation mirrors
+    # notify_inspectors: everything is contained except the process-level errors
+    # in INSPECTOR_UNISOLATED_ERRORS, which no callback has the right to swallow.
+    def notify_update_listeners(keys)
+      return if keys.nil? || keys.empty?
+
+      listeners = @update_listeners_mutex.synchronize { @update_listeners.dup }
+      listeners.each do |listener|
+        begin
+          listener.call(keys.dup)
+        rescue *INSPECTOR_UNISOLATED_ERRORS, DataSource::StreamingHandler::StreamStopped
+          # StreamStopped is the stream's own shutdown signal (Thread#raise from
+          # StreamingHandler#stop), never a listener failure.
+          raise
+        rescue Exception => e # rubocop:disable Lint/RescueException
+          @config.logger&.warn("Featureflip: flag update listener raised #{e.class}: #{e.message}")
+        end
+      end
     end
 
     def normalize_context(context)
@@ -543,6 +591,8 @@ module Featureflip
       @ref_count = 1
       @ref_mutex = Mutex.new
       @shut_down = false
+      @update_listeners = []
+      @update_listeners_mutex = Mutex.new
     end
 
     def self._configs_equal(a, b)
