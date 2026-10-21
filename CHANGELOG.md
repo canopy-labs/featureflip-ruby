@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.11.0 — 2026-10-20
+
+### Added
+
+- `wrapper_name:` and `wrapper_version:` on `Featureflip::Config`, for libraries that wrap this SDK, such as the OpenFeature provider. The wrapper's token follows the SDK's in the User-Agent on the flag fetch, event post and SSE stream, e.g. `featureflip-ruby/<version> my-wrapper/1.0.0`, so usage through the wrapper can be counted. A name that is not a valid HTTP product token is ignored with a logged warning rather than failing construction, and the wrapper does not trigger the "different config" warning. (#4154)
+
 ## 2.10.0 — 2026-10-09
 
 ### Added

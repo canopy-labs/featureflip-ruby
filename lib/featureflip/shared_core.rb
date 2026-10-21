@@ -595,6 +595,8 @@ module Featureflip
       @update_listeners_mutex = Mutex.new
     end
 
+    # wrapper_name/wrapper_version are deliberately excluded: they identify the caller
+    # rather than change behavior (see Config).
     def self._configs_equal(a, b)
       a.base_url == b.base_url &&
         a.streaming == b.streaming &&

@@ -194,6 +194,7 @@ end
 - **Thread-safe** - Mutex-protected flag store and event queue
 - **Fork-safe** - `restart` method for Puma/Unicorn/Passenger worker processes
 - **Zero runtime dependencies** - Uses only Ruby stdlib (`net/http`, `digest/md5`)
+- **OpenFeature** - use the [featureflip-openfeature](https://featureflip.io/docs/integrations/openfeature/#ruby) provider
 
 ## Requirements
 

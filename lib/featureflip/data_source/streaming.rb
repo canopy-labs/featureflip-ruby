@@ -160,7 +160,9 @@ module Featureflip
         req = Net::HTTP::Get.new(uri.request_uri)
         req["Authorization"] = @sdk_key
         req["Accept"] = "text/event-stream"
-        req["User-Agent"] = "featureflip-ruby/#{Featureflip::VERSION}"
+        # Same memoized value as the HTTP client, so an invalid wrapper is warned about
+        # once rather than on every reconnect.
+        req["User-Agent"] = @config.user_agent
 
         http.request(req) do |response|
           unless response.is_a?(Net::HTTPSuccess)

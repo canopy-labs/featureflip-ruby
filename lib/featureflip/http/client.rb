@@ -83,7 +83,7 @@ module Featureflip
 
         req["Authorization"] = @sdk_key
         req["Content-Type"] = "application/json"
-        req["User-Agent"] = "featureflip-ruby/#{Featureflip::VERSION}"
+        req["User-Agent"] = @config.user_agent
 
         response = http.request(req)
 

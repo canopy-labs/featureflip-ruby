@@ -1,6 +1,7 @@
 require_relative "featureflip/version"
 require_relative "featureflip/errors"
 require_relative "featureflip/config"
+require_relative "featureflip/sdk_identity"
 require_relative "featureflip/models/flag"
 require_relative "featureflip/models/segment"
 require_relative "featureflip/models/evaluation_detail"
