@@ -85,7 +85,7 @@ module Featureflip
       # the "different config" warning.
       @inspectors = config.inspectors || []
       @store = Store::FlagStore.new
-      @evaluator = Evaluation::Evaluator.new
+      @evaluator = Evaluation::Evaluator.new(logger: @config.logger)
       @initialized = false
       @closed = false
       @test_mode = false
@@ -579,7 +579,7 @@ module Featureflip
       @config = Config.new
       @inspectors = []
       @store = Store::FlagStore.new
-      @evaluator = Evaluation::Evaluator.new
+      @evaluator = Evaluation::Evaluator.new(logger: @config.logger)
       @initialized = true
       @closed = false
       @test_mode = true

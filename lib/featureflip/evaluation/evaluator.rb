@@ -1,5 +1,7 @@
 require_relative "condition_evaluator"
 require_relative "bucketing"
+require_relative "canonical_number"
+require_relative "unbucketable_warnings"
 
 module Featureflip
   module Evaluation
@@ -9,8 +11,9 @@ module Featureflip
       # the JS reference implementation; see prerequisite_spec.rb depth test.
       MAX_PREREQUISITE_DEPTH = 10
 
-      def initialize
+      def initialize(logger: nil)
         @condition_evaluator = ConditionEvaluator.new
+        @logger = logger
       end
 
       def evaluate(flag, context, get_segment: nil, all_flags: {})
@@ -63,7 +66,21 @@ module Featureflip
 
           if conditions_match
             variation_key = resolve_serve(rule.serve, context)
+            # A rollout that can't bucket the context doesn't match; fall to the next rule (#4236).
+            if variation_key.nil?
+              warn_unbucketable(flag, rule.id, rule.serve)
+              next
+            end
+
+            # A served key that names no variation is malformed config: report Error (no
+            # rule id) with the served key, like the engine's ServeVariation (#4236).
             variation = flag.get_variation(variation_key)
+            if variation.nil?
+              result = Models::EvaluationDetail.new(value: nil, reason: "Error", variation_key: variation_key)
+              memo[flag.key] = result
+              return result
+            end
+
             result = Models::EvaluationDetail.new(
               value: variation&.value,
               reason: "RuleMatch",
@@ -76,9 +93,18 @@ module Featureflip
         end
 
         variation_key = resolve_serve(flag.fallthrough, context)
+        if variation_key.nil?
+          warn_unbucketable(flag, nil, flag.fallthrough)
+          variation_key = flag.fallthrough.variation || ""
+        end
         variation = flag.get_variation(variation_key)
+        if variation.nil?
+          result = Models::EvaluationDetail.new(value: nil, reason: "Error", variation_key: variation_key)
+          memo[flag.key] = result
+          return result
+        end
         result = Models::EvaluationDetail.new(
-          value: variation&.value,
+          value: variation.value,
           reason: "Fallthrough",
           variation_key: variation_key
         )
@@ -123,14 +149,26 @@ module Featureflip
 
       def off_result(flag, reason:, prerequisite_key: nil)
         variation = flag.get_variation(flag.off_variation)
+        # An off variation the flag doesn't define is malformed config: report Error
+        # (value nil, the key kept), like the engine's ServeVariation (#4236).
+        if variation.nil?
+          return Models::EvaluationDetail.new(value: nil, reason: "Error", variation_key: flag.off_variation)
+        end
+
         Models::EvaluationDetail.new(
-          value: variation&.value,
+          value: variation.value,
           reason: reason,
           variation_key: flag.off_variation,
           prerequisite_key: prerequisite_key
         )
       end
 
+      def warn_unbucketable(flag, rule_id, serve)
+        UnbucketableWarnings.warn(@logger, flag.key, rule_id, serve.bucket_by || "userId")
+      end
+
+      # Returns the variation key to serve, or nil when a Rollout serve can't bucket
+      # the context (see resolve_rollout). A Fixed serve never returns nil.
       def resolve_serve(serve, context)
         if serve.type == "Fixed"
           serve.variation || ""
@@ -145,7 +183,12 @@ module Featureflip
         # Alias "userId" <-> "user_id" for the built-in user identifier
         bucket_value = context["user_id"] if bucket_value.nil? && bucket_by == "userId"
         bucket_value = context["userId"] if bucket_value.nil? && bucket_by == "user_id"
-        bucket_value_str = bucket_value.nil? ? "" : bucket_value.to_s
+        bucket_value_str =
+          if bucket_value.nil? then ""
+          elsif bucket_value.is_a?(Float) then CanonicalNumber.format(bucket_value)
+          elsif defined?(::BigDecimal) && bucket_value.is_a?(::BigDecimal) then CanonicalNumber.format_big_decimal(bucket_value)
+          else bucket_value.to_s
+          end
 
         # A Rollout serve can arrive with no weighted variations -- env-level PercentageRollout
         # has nowhere to store per-variation weights, so the mapper emits type=Rollout with no
@@ -153,14 +196,10 @@ module Featureflip
         # empty key. Mirrors the engine + C#/Java SDK evaluators.
         return serve.variation || "" if (serve.variations || []).empty?
 
-        # Keyless user contexts can't be bucketed. Rather than hashing the empty value
-        # into an arbitrary salt-dependent bucket, serve the control (first) variation
-        # deterministically. The engine assigns a random GUID per eval (spreading
-        # anonymous users over HTTP); local SDK eval is deterministic, so parity is
-        # guaranteed only for keyed contexts (#1457).
-        if bucket_value_str == "" && %w[userId user_id].include?(bucket_by) && !(serve.variations || []).empty?
-          return serve.variations[0].key
-        end
+        # A missing, nil or empty bucket value can't be bucketed: return nil so the caller
+        # skips the rule (or serves the fallthrough's variation) instead of hashing the empty
+        # string into an arbitrary bucket. Whitespace, "0", 0 and false bucket normally (#4236).
+        return nil if bucket_value_str == ""
 
         bucket = Bucketing.compute_bucket(serve.salt || "", bucket_value_str)
 

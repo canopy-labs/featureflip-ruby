@@ -3,6 +3,8 @@ require "spec_helper"
 RSpec.describe Featureflip::Evaluation::Evaluator do
   subject(:evaluator) { described_class.new }
 
+  before { Featureflip::Evaluation::UnbucketableWarnings.reset }
+
   let(:true_variation) { Featureflip::Models::Variation.new(key: "true", value: true) }
   let(:false_variation) { Featureflip::Models::Variation.new(key: "false", value: false) }
 
@@ -38,6 +40,70 @@ RSpec.describe Featureflip::Evaluation::Evaluator do
       serve: Featureflip::Models::ServeConfig.new(type: "Fixed", variation: serve_variation),
       segment_key: segment_key
     )
+  end
+
+  describe "serving a variation key the flag does not define (#4236)" do
+    it "reports Error with the served key and no rule id for a rule serving an unknown key" do
+      flag = make_flag(rules: [make_rule(id: "r1", priority: 0, serve_variation: "zzz")])
+      result = evaluator.evaluate(flag, { "user_id" => "u1" })
+
+      expect(result.reason).to eq("Error")
+      expect(result.variation_key).to eq("zzz")
+      expect(result.rule_id).to be_nil
+      expect(result.value).to be_nil
+    end
+
+    it "reports Error for a fallthrough serving an unknown key" do
+      result = evaluator.evaluate(make_flag(fallthrough_variation: "zzz"), { "user_id" => "u1" })
+
+      expect(result.reason).to eq("Error")
+      expect(result.variation_key).to eq("zzz")
+    end
+
+    it "matches normally when the flag has a variation keyed with the empty string" do
+      flag = make_flag(rules: [make_rule(id: "r1", priority: 0, serve_variation: "")])
+      flag.variations << Featureflip::Models::Variation.new(key: "", value: "empty")
+      result = evaluator.evaluate(flag, { "user_id" => "u1" })
+
+      expect(result.reason).to eq("RuleMatch")
+      expect(result.rule_id).to eq("r1")
+      expect(result.variation_key).to eq("")
+      expect(result.value).to eq("empty")
+    end
+  end
+
+  describe "an off variation the flag does not define (#4236)" do
+    def with_prereq(flag, key)
+      flag.prerequisites = [Featureflip::Models::Prerequisite.new(prerequisite_flag_key: key, expected_variation_key: "true")]
+      flag
+    end
+
+    it "reports Error with the off key and no value for a disabled flag" do
+      result = evaluator.evaluate(make_flag(enabled: false, off_variation: "zzz"), { "user_id" => "u1" })
+
+      expect(result.reason).to eq("Error")
+      expect(result.variation_key).to eq("zzz")
+      expect(result.value).to be_nil
+    end
+
+    it "reports Error, not PrerequisiteFailed, when the failed-prerequisite off variation is undefined" do
+      parent = make_flag(enabled: false).tap { |f| f.key = "p" }
+      main = with_prereq(make_flag(off_variation: "zzz"), "p")
+      result = evaluator.evaluate(main, { "user_id" => "u1" }, all_flags: { "p" => parent })
+
+      expect(result.reason).to eq("Error")
+      expect(result.variation_key).to eq("zzz")
+    end
+
+    it "reports Error while serving its own off variation when a prerequisite's off variation is undefined" do
+      parent = make_flag(enabled: false, off_variation: "zzz").tap { |f| f.key = "p" }
+      main = with_prereq(make_flag, "p")
+      result = evaluator.evaluate(main, { "user_id" => "u1" }, all_flags: { "p" => parent })
+
+      expect(result.reason).to eq("Error")
+      expect(result.variation_key).to eq("false")
+      expect(result.value).to eq(false)
+    end
   end
 
   describe "#evaluate" do
@@ -256,39 +322,89 @@ RSpec.describe Featureflip::Evaluation::Evaluator do
         expect(values).to include(false)
       end
 
-      it "serves the control (first) variation for a keyless context (#1457)" do
-        # A thin control weight (1) means the old empty-string-hash collapse
-        # would virtually never land on "on" -- so this asserts the keyless
-        # guard, not the hash. Anonymous contexts can't be bucketed, so we
-        # serve the control deterministically rather than hashing the empty
-        # value into an arbitrary salt-dependent bucket.
-        wv_on = Featureflip::Models::WeightedVariation.new(key: "on", weight: 1)
-        wv_off = Featureflip::Models::WeightedVariation.new(key: "off", weight: 99)
+      context "when the rollout can't bucket the context (#4236)" do
+        let(:on_variation) { Featureflip::Models::Variation.new(key: "on", value: true) }
+        let(:off_variation) { Featureflip::Models::Variation.new(key: "off", value: false) }
+        let(:wv_on) { Featureflip::Models::WeightedVariation.new(key: "on", weight: 1) }
+        let(:wv_off) { Featureflip::Models::WeightedVariation.new(key: "off", weight: 99) }
+        let(:fixed_off) { Featureflip::Models::ServeConfig.new(type: "Fixed", variation: "off") }
 
-        on_variation = Featureflip::Models::Variation.new(key: "on", value: true)
-        off_variation = Featureflip::Models::Variation.new(key: "off", value: false)
+        def rollout_serve(bucket_by: "userId")
+          Featureflip::Models::ServeConfig.new(
+            type: "Rollout", bucket_by: bucket_by, salt: "test-salt", variations: [wv_on, wv_off], variation: "off"
+          )
+        end
 
-        flag = Featureflip::Models::FlagConfiguration.new(
-          key: "rollout-flag",
-          version: 1,
-          type: "Boolean",
-          enabled: true,
-          variations: [on_variation, off_variation],
-          rules: [],
-          fallthrough: Featureflip::Models::ServeConfig.new(
-            type: "Rollout",
-            bucket_by: "userId",
-            salt: "test-salt",
-            variations: [wv_on, wv_off]
-          ),
-          off_variation: "off"
-        )
+        def flag_with(key:, rules:, fallthrough:)
+          Featureflip::Models::FlagConfiguration.new(
+            key: key, version: 1, type: "Boolean", enabled: true,
+            variations: [on_variation, off_variation], rules: rules,
+            fallthrough: fallthrough, off_variation: "off"
+          )
+        end
 
-        results = 20.times.map { evaluator.evaluate(flag, {}) }
+        def rule(id, serve, priority: 0)
+          Featureflip::Models::TargetingRule.new(id: id, priority: priority, condition_groups: [], serve: serve)
+        end
 
-        expect(results.map(&:variation_key).uniq).to eq(["on"])
-        expect(results.map(&:value).uniq).to eq([true])
-        expect(results.map(&:reason).uniq).to eq(["Fallthrough"])
+        it "serves the fallthrough variation for a keyless context" do
+          flag = flag_with(key: "rb-keyless-fallthrough", rules: [], fallthrough: rollout_serve)
+          result = evaluator.evaluate(flag, {})
+          expect(result.variation_key).to eq("off")
+          expect(result.reason).to eq("Fallthrough")
+        end
+
+        it "skips a keyless rollout rule and serves the fallthrough" do
+          flag = flag_with(key: "rb-keyless-rule", rules: [rule("r1", rollout_serve)], fallthrough: fixed_off)
+          result = evaluator.evaluate(flag, {})
+          expect(result.variation_key).to eq("off")
+          expect(result.reason).to eq("Fallthrough")
+        end
+
+        it "continues to the next rule when a rollout rule can't bucket" do
+          fixed_on = Featureflip::Models::ServeConfig.new(type: "Fixed", variation: "on")
+          flag = flag_with(
+            key: "rb-keyless-next",
+            rules: [rule("r1", rollout_serve, priority: 0), rule("r2", fixed_on, priority: 1)],
+            fallthrough: fixed_off
+          )
+          result = evaluator.evaluate(flag, {})
+          expect(result.variation_key).to eq("on")
+          expect(result.reason).to eq("RuleMatch")
+          expect(result.rule_id).to eq("r2")
+        end
+
+        it "serves the fallthrough when a custom bucketBy is missing but userId is present" do
+          flag = flag_with(key: "rb-custom-missing", rules: [], fallthrough: rollout_serve(bucket_by: "anonymous_id"))
+          result = evaluator.evaluate(flag, { "userId" => "user-1" })
+          expect(result.variation_key).to eq("off")
+          expect(result.reason).to eq("Fallthrough")
+        end
+
+        it "treats an explicit nil and an empty string as unbucketable" do
+          flag = flag_with(key: "rb-nil-empty", rules: [], fallthrough: rollout_serve(bucket_by: "k"))
+          expect(Featureflip::Evaluation::Bucketing).not_to receive(:compute_bucket)
+          [nil, ""].each do |v|
+            expect(evaluator.evaluate(flag, { "k" => v }).variation_key).to eq("off")
+          end
+        end
+
+        it "still buckets false, 0, whitespace and \"0\"" do
+          flag = flag_with(key: "rb-bucketable", rules: [], fallthrough: rollout_serve(bucket_by: "k"))
+          # A boolean hashes as JSON spells it, which is to_s; the engine's "True" would differ.
+          { false => "false", true => "true", 0 => "0", " " => " ", "0" => "0" }.each do |v, hashed|
+            expect(Featureflip::Evaluation::Bucketing).to receive(:compute_bucket).with("test-salt", hashed).and_call_original
+            evaluator.evaluate(flag, { "k" => v })
+          end
+        end
+
+        it "does not skip a rollout serve with no variations (#1469 degrade)" do
+          serve = Featureflip::Models::ServeConfig.new(type: "Rollout", variation: "on", variations: [])
+          flag = flag_with(key: "rb-degrade", rules: [rule("r1", serve)], fallthrough: fixed_off)
+          result = evaluator.evaluate(flag, {})
+          expect(result.variation_key).to eq("on")
+          expect(result.reason).to eq("RuleMatch")
+        end
       end
 
       it "serves the default variation when a rollout serve has no variations (#1469)" do
