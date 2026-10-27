@@ -51,7 +51,10 @@ RSpec.describe "golden: event payload vectors" do
       stub_request(:get, "#{base_url}/v1/sdk/flags")
         .to_return(
           status: 200,
-          body: JSON.generate(flags: [], segments: []),
+          body: JSON.generate(
+            environment: "test", version: 1,
+            flags: v.fetch("flags", []), segments: v.fetch("segments", [])
+          ),
           headers: { "Content-Type" => "application/json" }
         )
 
@@ -68,7 +71,9 @@ RSpec.describe "golden: event payload vectors" do
       client = Featureflip::Client.get(sdk_key, config: config)
 
       begin
-        if v["kind"] == "identify"
+        if v["kind"] == "evaluation"
+          client.bool_variation(v["flagKey"], v["context"], false)
+        elsif v["kind"] == "identify"
           client.identify(v["context"])
         elsif v.key?("metadata")
           client.track(v["eventKey"], v["context"], v["metadata"])
@@ -98,6 +103,78 @@ RSpec.describe "golden: event payload vectors" do
     end
 
     # A runner that silently skips everything is worse than no runner at all.
-    expect(executed).to be >= 13
+    expect(executed).to be >= 19
+  end
+
+  # An Error read can still carry the rule that selected the variation (here a
+  # String flag read through the bool accessor); that rule did not serve the
+  # traffic, so the event must not name it.
+  it "omits ruleId when a rule-served value is rejected by the typed accessor" do
+    captured = []
+    flag = {
+      "key" => "greeting", "version" => 1, "type" => "String", "enabled" => true,
+      "variations" => [{ "key" => "hi", "value" => "hello" }, { "key" => "bye", "value" => "bye" }],
+      "rules" => [{
+        "id" => "rule-1", "priority" => 0, "segmentKey" => nil,
+        "conditionGroups" => [{ "operator" => "And", "conditions" => [
+          { "attribute" => "plan", "operator" => "Equals", "values" => ["pro"], "negate" => false }
+        ] }],
+        "serve" => { "type" => "Fixed", "variation" => "hi" }
+      }],
+      "fallthrough" => { "type" => "Fixed", "variation" => "bye" },
+      "offVariation" => "bye", "prerequisites" => []
+    }
+    stub_request(:get, "#{base_url}/v1/sdk/flags")
+      .to_return(status: 200, body: JSON.generate(environment: "test", version: 1, flags: [flag], segments: []),
+                 headers: { "Content-Type" => "application/json" })
+    stub_request(:post, "#{base_url}/v1/sdk/events")
+      .to_return { |request| captured.concat(JSON.parse(request.body)["events"]); { status: 202 } }
+
+    config = Featureflip::Config.new(
+      base_url: base_url, streaming: false, send_events: true, poll_interval: 9999, flush_interval: 9999
+    )
+    client = Featureflip::Client.get("events-typed-error", config: config)
+    begin
+      expect(client.bool_variation("greeting", { "user_id" => "u", "plan" => "pro" }, false)).to eq(false)
+      client.flush
+    ensure
+      client.close
+    end
+
+    expect(captured.length).to eq(1)
+    expect(captured.first["reason"]).to eq("error")
+    expect(captured.first).not_to have_key("ruleId")
+  end
+
+  # The evaluator raising degrades the read to the caller's default with reason
+  # Error, and the read is still counted, as in every other server SDK.
+  it "records an error event when the evaluator raises" do
+    captured = []
+    flag = {
+      "key" => "flag", "version" => 1, "type" => "Boolean", "enabled" => true,
+      "variations" => [{ "key" => "on", "value" => true }, { "key" => "off", "value" => false }],
+      "rules" => [], "fallthrough" => { "type" => "Fixed", "variation" => "on" },
+      "offVariation" => "off", "prerequisites" => []
+    }
+    stub_request(:get, "#{base_url}/v1/sdk/flags")
+      .to_return(status: 200, body: JSON.generate(environment: "test", version: 1, flags: [flag], segments: []),
+                 headers: { "Content-Type" => "application/json" })
+    stub_request(:post, "#{base_url}/v1/sdk/events")
+      .to_return { |request| captured.concat(JSON.parse(request.body)["events"]); { status: 202 } }
+
+    config = Featureflip::Config.new(
+      base_url: base_url, streaming: false, send_events: true, poll_interval: 9999, flush_interval: 9999
+    )
+    client = Featureflip::Client.get("events-evaluator-raises", config: config)
+    begin
+      allow_any_instance_of(Featureflip::Evaluation::Evaluator).to receive(:evaluate).and_raise(StandardError, "boom")
+      expect(client.bool_variation("flag", { "user_id" => "u" }, false)).to eq(false)
+      client.flush
+    ensure
+      client.close
+    end
+
+    expect(captured).to eq([{ "type" => "Evaluation", "flagKey" => "flag", "userId" => "u",
+                              "timestamp" => captured.first["timestamp"], "reason" => "error" }])
   end
 end

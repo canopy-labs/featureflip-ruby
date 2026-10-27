@@ -5,11 +5,14 @@ module Featureflip
     # BucketValueFormatter.CanonicalNumber, so every SDK hashes one number to one
     # bucket. Used only on the bucket path; condition evaluation is unaffected.
     module CanonicalNumber
-      # A BigDecimal with no fractional part keeps its exact integer digits (like the
-      # engine's raw integer text); anything else goes through Float (#4236).
+      # A BigDecimal below 1e21 with no fractional part keeps its exact integer digits (like
+      # the engine's raw integer text); anything else goes through Float (#4236). The 1e21
+      # cap is where ECMAScript spelling turns exponential, and stops BigDecimal("1E+999999999")
+      # expanding to a billion digits per evaluation (#4246). BigDecimal#exponent is n in
+      # 0.ddd * 10**n, so |d| < 1e21 is exponent <= 21.
       def self.format_big_decimal(d)
         return format(d.to_f) unless d.finite?
-        return d.to_i.to_s if d.frac.zero?
+        return d.to_i.to_s if d.exponent <= 21 && d.frac.zero?
 
         format(d.to_f)
       end

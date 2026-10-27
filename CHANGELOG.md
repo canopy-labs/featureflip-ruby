@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.13.0 — 2026-10-26
+
+### Added
+
+- The `Evaluation` analytics event now carries the evaluation `reason` (`rule-match`, `fallthrough`, `flag-disabled`, `prerequisite-failed`, `error` or `flag-not-found`) and, on a rule match, the matched `ruleId`, and now also `prerequisiteKey` when a prerequisite failed. Absent fields are omitted. The public API is unchanged. (#4268)
+- A read whose evaluation raises now records an `Evaluation` event with reason `error`, as the other server SDKs do. It previously recorded none. (#4268)
+
+### Fixed
+
+- A `BigDecimal` rollout bucket value of 1e21 or more now converts to a Float, like a non-integral one, instead of expanding to its full integer digits. A huge exponent such as `BigDecimal("1E+999999999")` no longer builds a billion-digit string on every evaluation. A context bucketed on an integral `BigDecimal` at or above 1e21 may get a different variant. (#4246)
+
 ## 2.12.0 — 2026-10-22
 
 ### Changed

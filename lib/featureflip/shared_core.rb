@@ -185,7 +185,7 @@ module Featureflip
 
       flag = @store.get_flag(key)
       unless flag
-        record_evaluation(key, context, nil)
+        record_evaluation(key, context, nil, reason: "FlagNotFound")
         notify_inspectors(key, context, default_value, reason: "FlagNotFound")
         return Models::EvaluationDetail.new(value: default_value, reason: "FlagNotFound")
       end
@@ -224,7 +224,10 @@ module Featureflip
         reason = "Error"
       end
 
-      record_evaluation(key, context, result.variation_key)
+      record_evaluation(
+        key, context, result.variation_key,
+        reason: reason, rule_id: result.rule_id, prerequisite_key: result.prerequisite_key
+      )
       notify_inspectors(
         key, context, value,
         reason: reason,
@@ -244,6 +247,7 @@ module Featureflip
       # Prerequisite-resolution failures return PrerequisiteFailed cleanly through
       # the evaluator; this rescue only fires on unexpected exceptions (malformed
       # config, programming errors), so prerequisite_key has no defined value.
+      record_evaluation(key, context, nil, reason: "Error")
       notify_inspectors(key, context, default_value, reason: "Error")
       Models::EvaluationDetail.new(value: default_value, reason: "Error", prerequisite_key: nil)
     end
@@ -521,16 +525,36 @@ module Featureflip
       event
     end
 
-    def record_evaluation(key, context, variation_key)
+    # The kebab-case reason categories the Evaluation event carries (#4268), so
+    # the source of traffic reads the same whichever SDK reported it. The
+    # PascalCase names stay the public EvaluationDetail API; only the event is
+    # translated.
+    WIRE_REASONS = {
+      "RuleMatch" => "rule-match",
+      "Fallthrough" => "fallthrough",
+      "FlagDisabled" => "flag-disabled",
+      "FlagNotFound" => "flag-not-found",
+      "PrerequisiteFailed" => "prerequisite-failed",
+      "Error" => "error"
+    }.freeze
+
+    # +ruleId+ rides only on a rule match: an Error read can still carry the rule
+    # that selected a malformed variation, and that rule did not serve the
+    # traffic. Absent optionals are compacted away so they are omitted, never null.
+    def record_evaluation(key, context, variation_key, reason:, rule_id: nil, prerequisite_key: nil)
       return unless @event_processor
 
-      @event_processor.queue_event(compact_event({
+      event = {
         type: "Evaluation",
         flagKey: key,
         userId: resolve_event_user_id(context),
         variation: variation_key,
-        timestamp: Time.now.utc.iso8601
-      }))
+        timestamp: Time.now.utc.iso8601,
+        prerequisiteKey: prerequisite_key,
+        reason: WIRE_REASONS[reason],
+        ruleId: reason == "RuleMatch" ? rule_id : nil
+      }
+      @event_processor.queue_event(event.compact)
     end
 
     # Fire the registered evaluation inspectors. Called once per variation call
