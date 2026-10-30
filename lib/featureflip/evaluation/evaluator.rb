@@ -1,3 +1,4 @@
+require_relative "context_attribute"
 require_relative "condition_evaluator"
 require_relative "bucketing"
 require_relative "canonical_number"
@@ -164,7 +165,7 @@ module Featureflip
       end
 
       def warn_unbucketable(flag, rule_id, serve)
-        UnbucketableWarnings.warn(@logger, flag.key, rule_id, serve.bucket_by || "userId")
+        UnbucketableWarnings.warn(@logger, flag.key, rule_id, serve.bucket_by || "user_id")
       end
 
       # Returns the variation key to serve, or nil when a Rollout serve can't bucket
@@ -178,13 +179,13 @@ module Featureflip
       end
 
       def resolve_rollout(serve, context)
-        bucket_by = serve.bucket_by || "userId"
-        bucket_value = context[bucket_by]
-        # Alias "userId" <-> "user_id" for the built-in user identifier
-        bucket_value = context["user_id"] if bucket_value.nil? && bucket_by == "userId"
-        bucket_value = context["userId"] if bucket_value.nil? && bucket_by == "user_id"
+        bucket_by = serve.bucket_by || "user_id"
+        # "user_id" and "userId" resolve the same identity (user_id first).
+        bucket_value = ContextAttribute.resolve(context, bucket_by)
         bucket_value_str =
-          if bucket_value.nil? then ""
+          # An Array or Hash (a JSON array or object, empty or not) has no spelling every
+          # SDK shares, so it can't be bucketed, like a missing value (#4572).
+          if bucket_value.nil? || bucket_value.is_a?(Array) || bucket_value.is_a?(Hash) then ""
           elsif bucket_value.is_a?(Float) then CanonicalNumber.format(bucket_value)
           elsif defined?(::BigDecimal) && bucket_value.is_a?(::BigDecimal) then CanonicalNumber.format_big_decimal(bucket_value)
           else bucket_value.to_s
@@ -196,7 +197,7 @@ module Featureflip
         # empty key. Mirrors the engine + C#/Java SDK evaluators.
         return serve.variation || "" if (serve.variations || []).empty?
 
-        # A missing, nil or empty bucket value can't be bucketed: return nil so the caller
+        # A missing, nil, empty or non-scalar bucket value can't be bucketed: return nil so the caller
         # skips the rule (or serves the fallthrough's variation) instead of hashing the empty
         # string into an arbitrary bucket. Whitespace, "0", 0 and false bucket normally (#4236).
         return nil if bucket_value_str == ""

@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.13.1 — 2026-10-30
+
+### Fixed
+
+- A rollout whose Bucket by value is an `Array` or `Hash` (empty or not) can't be bucketed, so the rule is skipped like one with no value. It used to hash `value.to_s`, which put the context in a different bucket than the evaluation engine and the other SDKs. (#4572)
+- `user_id` is now the canonical user-identifier spelling, with `userId` accepted as an alias. A targeting condition on `user_id` or `userId` resolves the same identity for either spelling (`user_id` first, then `userId`), where a condition on `user_id` used to miss a context that only set `userId`. A context that sets both spellings now buckets on `user_id`, and a rollout with no Bucket by defaults to `user_id`. (#4518)
+
 ## 2.13.0 — 2026-10-26
 
 ### Added

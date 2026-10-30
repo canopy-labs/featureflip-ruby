@@ -252,14 +252,26 @@ RSpec.describe "golden vectors" do
   # ---------------------------------------------------------------------------
 
   describe "flag vectors" do
+    # Ruby is a map-context SDK that keeps the caller's identifier casing, so it
+    # runs every vector; an unknown capability token is skipped.
+    supported = %w[mapContext exactCaseIdentity]
+    executed = 0
     VECTORS["flagVectors"].each do |v|
+      next unless (v["requires"] || []).all? { |t| supported.include?(t) }
+
+      executed += 1
       it "#{v["id"]}: full flag evaluation matches engine" do
         all_flags = v["flags"].to_h { |f| [f["key"], build_flag(f)] }
         segments = (v["segments"] || []).to_h { |s| [s["key"], build_segment(s)] }
 
         # Context: userId at top level + any extra attributes.
-        ctx = { "userId" => v.dig("context", "userId") }
-        (v.dig("context", "attributes") || {}).each { |k, val| ctx[k] = val }
+        if v.key?("wireContext")
+          # A wireContext map is the caller's raw context, passed through verbatim.
+          ctx = v["wireContext"].dup
+        else
+          ctx = { "userId" => v.dig("context", "userId") }
+          (v.dig("context", "attributes") || {}).each { |k, val| ctx[k] = val }
+        end
 
         result = evaluator.evaluate(
           all_flags[v["flagKey"]],
@@ -273,6 +285,11 @@ RSpec.describe "golden vectors" do
         expect(JSON.generate(result.value)).to eq(JSON.generate(exp["value"])), "#{v["id"]}: value"
         expect(normalize_reason(result)).to eq(exp["reason"]), "#{v["id"]}: reason"
       end
+    end
+
+    it "executed every flag vector" do
+      expect(executed).to eq(VECTORS["flagVectors"].length)
+      expect(executed).to be >= 71
     end
   end
 end

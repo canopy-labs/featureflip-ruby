@@ -1,3 +1,4 @@
+require_relative "context_attribute"
 require "time"
 
 module Featureflip
@@ -10,7 +11,7 @@ module Featureflip
       REGEX_TIMEOUT_SECONDS = 0.1
 
       def evaluate_condition(condition, context)
-        attr_value = context[condition.attribute]
+        attr_value = ContextAttribute.resolve(context, condition.attribute)
 
         return condition.negate if attr_value.nil?
 
