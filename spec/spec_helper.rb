@@ -5,6 +5,7 @@ end
 
 require "featureflip"
 require "webmock/rspec"
+require_relative "support/recording_store"
 
 WebMock.disable_net_connect!
 

@@ -28,6 +28,13 @@ module Featureflip
       @core.initialized?
     end
 
+    # Where the flag data came from: a StartupInfo whose +source+ is "live" after a
+    # successful fetch, "snapshot" when started from the configured snapshot_store, or
+    # "none" (defaults served). It moves to "live" once the Evaluation API is reached.
+    def startup_info
+      @core.startup_info
+    end
+
     def bool_variation(key, context, default_value)
       return default_value if @closed
       @core.bool_variation(key, context, default_value)

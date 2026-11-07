@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.14.0 — 2026-11-07
+
+### Added
+
+- Opt-in snapshot store: with `snapshot_store` set, the SDK saves the flag configuration as it receives it, and a later start that can't reach the Evaluation API loads the saved copy instead of serving defaults. A built-in `FileSnapshotStore` writes it to a local file, and you can implement the store interface to share one snapshot through something like Redis. A snapshot older than `max_snapshot_age_seconds` (24 hours by default) is ignored. `client.startup_info` reports whether the client started from the live API, a snapshot, or neither. Off unless you set it. (#4652)
+
+### Security
+
+- The shared core no longer writes the full SDK key to the log at INFO when it shuts down. Versions 2.0.0 through 2.13.1 logged `Featureflip: core shut down for SDK key <key>` on every shutdown. If your application logs at INFO, treat SDK keys that appear in those logs as exposed and rotate them. (#5152)
+
 ## 2.13.1 — 2026-10-30
 
 ### Fixed

@@ -13,6 +13,30 @@ module Featureflip
     # than changing behavior.
     attr_accessor :wrapper_name, :wrapper_version
 
+    # Opt-in last-known-config store (see Featureflip::FileSnapshotStore). When the
+    # initial fetch fails or times out the client starts from the stored snapshot
+    # instead of serving defaults. Honored on the first Client.get per SDK key. Not
+    # part of the different-config comparison; its identity is compared separately.
+    attr_accessor :snapshot_store
+
+    # How old a stored snapshot may be and still be used, in seconds. Must be a
+    # positive, finite number; there is no "never expire" value.
+    DEFAULT_MAX_SNAPSHOT_AGE_SECONDS = 86_400
+    UNSET = Object.new.freeze
+    private_constant :UNSET
+    attr_reader :max_snapshot_age_seconds
+
+    def max_snapshot_age_seconds=(value)
+      @max_snapshot_age_explicit = true
+      @max_snapshot_age_seconds = value
+    end
+
+    # True when the caller passed a max age, so the "option ignored" warning can tell
+    # an omitted option from the default.
+    def max_snapshot_age_explicit?
+      @max_snapshot_age_explicit
+    end
+
     # Evaluation inspectors -- callables invoked once per variation call with a
     # Models::EvaluationEvent. Always an Array; non-callable entries are dropped
     # on assignment rather than blowing up on the evaluation hot path.
@@ -33,7 +57,9 @@ module Featureflip
       logger: nil,
       inspectors: nil,
       wrapper_name: nil,
-      wrapper_version: nil
+      wrapper_version: nil,
+      snapshot_store: nil,
+      max_snapshot_age_seconds: UNSET
     )
       @sdk_key = sdk_key
       @base_url = base_url
@@ -50,6 +76,9 @@ module Featureflip
       self.inspectors = inspectors
       @wrapper_name = wrapper_name
       @wrapper_version = wrapper_version
+      @snapshot_store = snapshot_store
+      @max_snapshot_age_explicit = !UNSET.equal?(max_snapshot_age_seconds)
+      @max_snapshot_age_seconds = @max_snapshot_age_explicit ? max_snapshot_age_seconds : DEFAULT_MAX_SNAPSHOT_AGE_SECONDS
 
       validate!
     end
@@ -76,6 +105,7 @@ module Featureflip
     def validate!
       finalize!
       validate_positive_fields!
+      validate_snapshot_options!
     end
 
     private
@@ -91,6 +121,17 @@ module Featureflip
           raise ConfigurationError, "#{field} must be positive, got #{value}"
         end
       end
+    end
+
+    def validate_snapshot_options!
+      age = @max_snapshot_age_seconds
+      valid = age.is_a?(Numeric) && !age.is_a?(Complex) && age.to_f.finite? && age.positive?
+      unless valid
+        raise ConfigurationError, "max_snapshot_age_seconds must be a positive, finite number, got #{age.inspect}"
+      end
+      return if @snapshot_store.nil? || (@snapshot_store.respond_to?(:get) && @snapshot_store.respond_to?(:put))
+
+      raise ConfigurationError, "snapshot_store must respond to #get and #put"
     end
 
     def default_logger

@@ -45,6 +45,7 @@ module Featureflip
                 "Using existing configuration. Close all handles first to apply new config."
               )
             end
+            _warn_snapshot_options_ignored(existing._config, config)
             return existing
           else
             # Stale entry — remove and replace
@@ -56,6 +57,22 @@ module Featureflip
         LIVE_CORES[sdk_key] = core
         core
       end
+    end
+
+    # The snapshot store is honored on the first get per SDK key. A later get that
+    # passes a different store instance, or an explicit different max age, is told so.
+    # An omitted store or max age is not a request, so a wrapper that does not forward
+    # them never triggers the warning.
+    def self._warn_snapshot_options_ignored(existing, requested)
+      store_differs = !requested.snapshot_store.nil? && !requested.snapshot_store.equal?(existing.snapshot_store)
+      age_differs = requested.max_snapshot_age_explicit? &&
+                    requested.max_snapshot_age_seconds != existing.max_snapshot_age_seconds
+      return unless store_differs || age_differs
+
+      requested.logger&.warn(
+        "Featureflip: snapshot_store/max_snapshot_age_seconds option ignored because a client " \
+        "for this SDK key already exists. Close all handles first to apply it."
+      )
     end
 
     def self._create_for_testing(flags)
@@ -75,9 +92,20 @@ module Featureflip
 
     # --- Instance methods ---
 
-    def initialize(sdk_key:, config:)
+    # Wall and monotonic clocks, injectable so the refresh rule is testable without
+    # waiting minutes.
+    # @api private
+    Clock = Struct.new(:wall_ms, :monotonic)
+    SYSTEM_CLOCK = Clock.new(
+      -> { (Time.now.to_f * 1000).to_i },
+      -> { Process.clock_gettime(Process::CLOCK_MONOTONIC) }
+    ).freeze
+
+    def initialize(sdk_key:, config:, clock: SYSTEM_CLOCK)
       @sdk_key = sdk_key
       @config = config
+      @clock = clock
+      init_snapshot_state
       # Snapshot the (already-filtered) inspector list at construction: config is
       # immutable-after-init from the core's point of view, so the evaluation path
       # needs no locking. Deliberately excluded from _configs_equal -- callables
@@ -145,6 +173,12 @@ module Featureflip
 
     def initialized?
       @initialized
+    end
+
+    # Where the flag data came from: live, a stored snapshot, or nowhere. Moves to
+    # live on the first successful full live apply.
+    def startup_info
+      @startup || StartupInfo.new(Snapshot::SOURCE_LIVE)
     end
 
     # --- Evaluation methods ---
@@ -298,6 +332,9 @@ module Featureflip
       # would leave a restarted non-streaming core with no data source at all.
       @streaming_handler = nil
       @polling_handler = nil
+      # A forked child has no writer thread, so a slot the parent claimed would stay
+      # claimed forever and wedge persistence.
+      reset_write_slot
 
       if @config.streaming
         start_streaming
@@ -339,7 +376,7 @@ module Featureflip
       end
       @event_processor = nil
 
-      @config.logger&.info("Featureflip: core shut down for SDK key #{@sdk_key}")
+      @config.logger&.info("Featureflip: core shut down")
     end
 
     def bootstrap!
@@ -349,18 +386,118 @@ module Featureflip
       start_event_processor if @config.send_events
     end
 
+    # Without a snapshot store a failure raises InitializationError, as before. With
+    # one, the failure falls back to the stored snapshot (or defaults) and init
+    # completes; the data source started afterwards keeps trying and recovers.
     def fetch_initial_flags
-      Timeout.timeout(@config.init_timeout) do
-        flags, segments = @http_client.get_flags
-        @store.init(flags, segments)
-        @initialized = true
+      # Only the fetch is under the timeout. Applying inside it would let a timeout that
+      # lands after a successful fetch fall back to a snapshot over live data.
+      flags, segments = Timeout.timeout(@config.init_timeout) { @http_client.get_flags }
+      # Establishes the baseline; fires nothing (the store has no snapshot yet).
+      apply_snapshot(flags, segments)
+      @initialized = true
+    rescue Timeout::Error => e
+      if @config.snapshot_store.nil?
+        raise InitializationError, "Initialization timed out after #{@config.init_timeout}s"
       end
-    rescue Timeout::Error
-      raise InitializationError, "Initialization timed out after #{@config.init_timeout}s"
+
+      fall_back_to_snapshot(e, timed_out: true)
     rescue InitializationError
       raise
     rescue StandardError => e
-      raise InitializationError, "Failed to initialize: #{e.message}"
+      raise InitializationError, "Failed to initialize: #{e.message}" if @config.snapshot_store.nil?
+
+      fall_back_to_snapshot(e, timed_out: false)
+    end
+
+    def fall_back_to_snapshot(error, timed_out:)
+      load_snapshot_fallback(describe_init_failure(error, timed_out))
+      @initialized = true
+    end
+
+    # A short, key-free reason the initial fetch failed. A revoked key (HTTP 401/403)
+    # must read differently from an unreachable host.
+    def describe_init_failure(error, timed_out)
+      return "timed out after #{@config.init_timeout}s" if timed_out
+      return "HTTP #{error.status}" if error.respond_to?(:status) && error.status.is_a?(Integer)
+
+      message = error.message.to_s
+      message.empty? ? error.class.name : message
+    end
+
+    # Read the store on a thread, bounded by init_timeout. Returns [finished, value].
+    # A raising store is a miss (warned). A read still running at the deadline is
+    # abandoned and its late result ignored.
+    def read_snapshot_store(cause)
+      store = @config.snapshot_store
+      box = {}
+      reader = Thread.new do
+        box[:value] = store.get
+      rescue StandardError, ScriptError => e
+        box[:error] = e
+      end
+      reader.report_on_exception = false
+      unless reader.join(@config.init_timeout)
+        @config.logger&.warn(
+          "Featureflip: initial flag fetch failed (#{cause}) and the snapshot store read timed out " \
+          "after #{@config.init_timeout}s; serving defaults"
+        )
+        return [false, nil]
+      end
+      if box.key?(:error)
+        @config.logger&.warn(
+          "Featureflip: initial flag fetch failed (#{cause}) and the snapshot store read failed: " \
+          "#{box[:error].message}; serving defaults"
+        )
+        return [true, nil]
+      end
+      [true, box[:value]]
+    end
+
+    # Serve the stored snapshot after a failed initial fetch. Never raises. Applied
+    # without persisting, so loading it does not refresh its own fetchedAt. The store
+    # hands back opaque text; every check and every reason is decided here.
+    def load_snapshot_fallback(cause)
+      finished, value = read_snapshot_store(cause)
+      return unless finished # the read already warned
+
+      if value.nil? # a plain miss: no reason
+        @config.logger&.warn(
+          "Featureflip: initial flag fetch failed (#{cause}); no persisted snapshot; serving defaults"
+        )
+        return
+      end
+
+      now = @clock.wall_ms.call
+      begin
+        decoded = Snapshot.decode_envelope(value, @key_hash, now)
+      rescue Snapshot::InvalidError => e
+        reject_snapshot(cause, Snapshot::REASON_INVALID, e.why)
+        return
+      end
+      age_ms = [0, now - decoded.fetched_at_ms].max
+      age_seconds = age_ms / 1000
+      limit = @config.max_snapshot_age_seconds
+      if age_ms > limit * 1000
+        reject_snapshot(cause, Snapshot::REASON_EXPIRED, "#{age_seconds}s old, limit #{limit}s", age_seconds)
+        return
+      end
+
+      @store.init(decoded.flags, decoded.segments)
+      @startup = StartupInfo.new(Snapshot::SOURCE_SNAPSHOT, Snapshot::REASON_SNAPSHOT, age_seconds)
+      @config.logger&.warn(
+        "Featureflip: initial flag fetch failed (#{cause}); serving persisted snapshot (#{age_seconds}s old)"
+      )
+    rescue StandardError => e
+      @config.logger&.warn("Featureflip: snapshot load failed: #{e.class}: #{e.message}")
+    end
+
+    def reject_snapshot(cause, reason, why, age_seconds = nil)
+      @startup = StartupInfo.new(Snapshot::SOURCE_NONE, reason, age_seconds)
+      @config.logger&.warn(
+        "Featureflip: initial flag fetch failed (#{cause}); ignoring persisted snapshot " \
+        "(#{reason}: #{why}); serving defaults"
+      )
     end
 
     def start_data_source
@@ -382,6 +519,7 @@ module Featureflip
         on_flag_deleted: ->(key) { apply_flag_delete(key) },
         on_segment_updated: ->(flags, segments) { apply_snapshot(flags, segments) },
         on_sync: ->(flags, segments) { apply_snapshot(flags, segments) },
+        on_ping: -> { on_streaming_ping },
         on_error: ->(_err) { },
         on_fallback_to_polling: -> { fallback_to_polling },
         on_recovered: -> { stop_fallback_polling }
@@ -461,15 +599,185 @@ module Featureflip
     # Every data-source write funnels through one of these three so the change
     # set is computed by the store and reported in one place.
     def apply_snapshot(flags, segments)
-      notify_update_listeners(@store.init(flags, segments))
+      changed = @store.init(flags, segments)
+      @startup = StartupInfo.new(Snapshot::SOURCE_LIVE)
+      persist_full
+      notify_update_listeners(changed)
     end
 
     def apply_flag_update(flag)
-      notify_update_listeners(@store.upsert(flag))
+      changed = @store.upsert(flag)
+      persist_delta
+      notify_update_listeners(changed)
     end
 
     def apply_flag_delete(key)
-      notify_update_listeners(@store.remove_flag(key))
+      changed = @store.remove_flag(key)
+      persist_delta
+      notify_update_listeners(changed)
+    end
+
+    # --- Snapshot persistence ---
+
+    def init_snapshot_state
+      @startup = StartupInfo.new(Snapshot::SOURCE_NONE)
+      @key_hash = Snapshot.compute_key_hash(@config.base_url, @sdk_key)
+      @snapshot_mutex = Mutex.new
+      @persist_in_flight = false
+      @persist_queued = false
+      @last_persist_at = nil
+      @last_persisted_data = nil
+    end
+
+    def snapshot_store
+      @config.snapshot_store
+    end
+
+    def snapshot_stopped?
+      @closed || @shut_down
+    end
+
+    def within_refresh_window?
+      last = @snapshot_mutex.synchronize { @last_persist_at }
+      !last.nil? && @clock.monotonic.call - last < Snapshot::REFRESH_INTERVAL_SECONDS
+    end
+
+    def serialize_state
+      Snapshot.serialize_flags_payload(@store.all_flags, @store.all_segments)
+    end
+
+    # After a single-flag delta, only once live: never right after a snapshot or
+    # none start, or stale data would get a fresh fetchedAt.
+    def persist_delta
+      persist if !snapshot_store.nil? && @startup.source == Snapshot::SOURCE_LIVE
+    end
+
+    # After a full live apply. Changed content is written at once. An unchanged state
+    # is only rewritten once the last write is a refresh interval old.
+    def persist_full
+      return if snapshot_store.nil? || snapshot_stopped?
+
+      if within_refresh_window?
+        begin
+          data = serialize_state
+        rescue StandardError => e
+          @config.logger&.warn("Featureflip: snapshot persist failed: #{e.class}: #{e.message}")
+          return
+        end
+        return if @snapshot_mutex.synchronize { data == @last_persisted_data }
+      end
+      persist
+    end
+
+    # The stream heartbeat: while live, refresh the stored fetchedAt at most once per
+    # refresh interval, so a healthy streaming client does not let its snapshot age out.
+    def on_streaming_ping
+      return if snapshot_store.nil? || @startup.source != Snapshot::SOURCE_LIVE
+      return if within_refresh_window?
+
+      persist
+    end
+
+    # Write the full state without blocking evaluation or init: at most one put in
+    # flight plus one trailing write, which reads the state when it runs.
+    def persist
+      return if snapshot_store.nil? || snapshot_stopped?
+
+      claimed = @snapshot_mutex.synchronize do
+        if @persist_in_flight
+          @persist_queued = true
+          false
+        else
+          @persist_in_flight = true
+        end
+      end
+      return unless claimed
+
+      @writer_started = false
+      begin
+        text = build_snapshot_text || finish_persist
+        if text.nil?
+          @writer_started = true # finish_persist already released the slot
+          return
+        end
+
+        start_write_thread(text)
+      rescue StandardError, ScriptError => e
+        # Can't start a thread. Don't leave the in-flight flag set, or every later
+        # write is wedged, and never let this escape into an apply.
+        @config.logger&.warn("Featureflip: snapshot persist failed: #{e.class}: #{e.message}")
+      ensure
+        # Also covers an Exception that is not a StandardError (a Timeout or stream
+        # stop landing here), which propagates after the slot is released.
+        reset_write_slot unless @writer_started
+      end
+    end
+
+    def reset_write_slot
+      @snapshot_mutex.synchronize do
+        @persist_in_flight = false
+        @persist_queued = false
+      end
+    end
+
+    def start_write_thread(text)
+      thread = Thread.new { persist_worker(text) }
+      # Marked the instant the thread exists: from here the writer owns the slot, so an
+      # exception landing later must not release it (that would allow a second writer).
+      @writer_started = true
+      silence_thread_report(thread)
+      thread
+    end
+
+    def silence_thread_report(thread)
+      thread.report_on_exception = false
+    end
+
+    # The envelope for the current state, stamped now. Never raises.
+    def build_snapshot_text
+      fetched_at = @clock.wall_ms.call
+      data = serialize_state
+      @snapshot_mutex.synchronize do
+        @last_persist_at = @clock.monotonic.call
+        @last_persisted_data = data
+      end
+      Snapshot.encode_envelope(@key_hash, fetched_at, data)
+    rescue StandardError => e
+      @config.logger&.warn("Featureflip: snapshot persist failed: #{e.class}: #{e.message}")
+      nil
+    end
+
+    # End one write. Returns the next envelope if a trailing write is due. No trailing
+    # write starts once the core is shut down.
+    def finish_persist
+      loop do
+        proceed = @snapshot_mutex.synchronize do
+          if @persist_queued && !snapshot_stopped?
+            @persist_queued = false
+            true
+          else
+            @persist_queued = false
+            @persist_in_flight = false
+            false
+          end
+        end
+        return nil unless proceed
+
+        text = build_snapshot_text
+        return text unless text.nil?
+      end
+    end
+
+    def persist_worker(text)
+      store = snapshot_store
+      until text.nil?
+        begin
+          store.put(text)
+        rescue StandardError, ScriptError => e
+          @config.logger&.warn("Featureflip: snapshot store write failed: #{e.class}: #{e.message}")
+        end
+        text = finish_persist
+      end
     end
 
     # Runs on the streaming/polling thread, OUTSIDE the store lock: listeners are
@@ -601,6 +909,9 @@ module Featureflip
     def init_test_mode(flags)
       @sdk_key = "test-key"
       @config = Config.new
+      @clock = SYSTEM_CLOCK
+      init_snapshot_state
+      @startup = StartupInfo.new(Snapshot::SOURCE_LIVE)
       @inspectors = []
       @store = Store::FlagStore.new
       @evaluator = Evaluation::Evaluator.new(logger: @config.logger)
@@ -633,6 +944,6 @@ module Featureflip
         a.send_events == b.send_events
     end
 
-    private_class_method :_configs_equal
+    private_class_method :_configs_equal, :_warn_snapshot_options_ignored
   end
 end

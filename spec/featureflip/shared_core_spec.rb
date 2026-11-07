@@ -18,6 +18,20 @@ RSpec.describe Featureflip::SharedCore do
       .to_return(status: 200, body: flags_response, headers: { "Content-Type" => "application/json" })
   end
 
+  describe "logging" do
+    it "never writes the SDK key to the logger through a create/release cycle" do
+      io = StringIO.new
+      logger = Logger.new(io, level: Logger::DEBUG)
+      secret = "sdk-SECRET-key-0123456789"
+
+      core = described_class._get_or_create(secret, make_config(logger: logger))
+      core._release
+
+      expect(io.string).to include("core shut down")
+      expect(io.string).not_to include(secret)
+    end
+  end
+
   describe "._get_or_create" do
     it "returns a core with refcount 1 on first call" do
       config = make_config

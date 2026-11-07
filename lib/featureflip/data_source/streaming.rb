@@ -36,7 +36,7 @@ module Featureflip
       RECONNECT_BASE_DELAY_SECONDS = 1
       MAX_BACKOFF_SECONDS = 30
 
-      def initialize(sdk_key:, config:, http_client:, on_flag_updated:, on_flag_deleted:, on_segment_updated:, on_error:, on_sync: nil, on_fallback_to_polling: nil, on_recovered: nil)
+      def initialize(sdk_key:, config:, http_client:, on_flag_updated:, on_flag_deleted:, on_segment_updated:, on_error:, on_sync: nil, on_fallback_to_polling: nil, on_recovered: nil, on_ping: nil)
         @sdk_key = sdk_key
         @config = config
         @http_client = http_client
@@ -47,6 +47,7 @@ module Featureflip
         @on_sync = on_sync
         @on_fallback_to_polling = on_fallback_to_polling
         @on_recovered = on_recovered
+        @on_ping = on_ping
         @stop_flag = false
         @thread = nil
         @retry_count = 0
@@ -283,6 +284,9 @@ module Featureflip
           # re-synced. Full replace, never a per-key merge.
           flags, segments = @http_client.parse_flags_response(JSON.parse(data))
           @on_sync&.call(flags, segments)
+        when "ping"
+          # The server's keep-alive: the stream is live and healthy.
+          @on_ping&.call
         end
       rescue UnevaluableEntityError => e
         # Not a malformed payload: the frame was well-formed and simply described

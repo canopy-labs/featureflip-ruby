@@ -36,6 +36,10 @@ module Featureflip
         @mutex.synchronize { @flags.values }
       end
 
+      def all_segments
+        @mutex.synchronize { @segments.values }
+      end
+
       def all_flags_map
         @mutex.synchronize { @flags.dup }
       end

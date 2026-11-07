@@ -58,6 +58,8 @@ client = Featureflip::Client.get("your-sdk-key", config: config)
 
 The SDK key can also be set via the `FEATUREFLIP_SDK_KEY` environment variable.
 
+To let a process that starts while the Evaluation API is unreachable serve its last known flags, pass `snapshot_store: Featureflip::FileSnapshotStore.new("/path/to/snapshot.json")` (and optionally `max_snapshot_age_seconds:`, default 86400). It is off unless you set it. See the [Ruby SDK docs](https://featureflip.io/docs/sdks/ruby/#starting-during-an-outage).
+
 ## Singleton Convenience API
 
 For applications that use a single client instance:
