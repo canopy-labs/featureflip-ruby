@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.15.0 — 2026-11-16
+
+### Security
+
+- The SDK key is now redacted from every log line the SDK emits, including error messages from the HTTP stack, and from the message of the `InitializationError` raised when the first fetch fails. Your own logger is wrapped, not modified. (#5167)
+
+### Changed
+
+- A client now works from a copy of the `Config` made when it is created, so changing a `Config` after `Client.get` no longer affects the running client.
+
 ## 2.14.0 — 2026-11-07
 
 ### Added

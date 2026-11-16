@@ -40,12 +40,12 @@ module Featureflip
         if existing
           if existing._acquire
             unless _configs_equal(existing._config, config)
-              config.logger&.warn(
+              RedactingLogger.wrap(config.logger, sdk_key)&.warn(
                 "Featureflip: Client.get called with different config for same SDK key. " \
                 "Using existing configuration. Close all handles first to apply new config."
               )
             end
-            _warn_snapshot_options_ignored(existing._config, config)
+            _warn_snapshot_options_ignored(existing._config, config, sdk_key)
             return existing
           else
             # Stale entry — remove and replace
@@ -63,13 +63,13 @@ module Featureflip
     # passes a different store instance, or an explicit different max age, is told so.
     # An omitted store or max age is not a request, so a wrapper that does not forward
     # them never triggers the warning.
-    def self._warn_snapshot_options_ignored(existing, requested)
+    def self._warn_snapshot_options_ignored(existing, requested, sdk_key)
       store_differs = !requested.snapshot_store.nil? && !requested.snapshot_store.equal?(existing.snapshot_store)
       age_differs = requested.max_snapshot_age_explicit? &&
                     requested.max_snapshot_age_seconds != existing.max_snapshot_age_seconds
       return unless store_differs || age_differs
 
-      requested.logger&.warn(
+      RedactingLogger.wrap(requested.logger, sdk_key)&.warn(
         "Featureflip: snapshot_store/max_snapshot_age_seconds option ignored because a client " \
         "for this SDK key already exists. Close all handles first to apply it."
       )
@@ -103,7 +103,11 @@ module Featureflip
 
     def initialize(sdk_key:, config:, clock: SYSTEM_CLOCK)
       @sdk_key = sdk_key
-      @config = config
+      # Every log line the SDK writes goes through @config.logger, so wrapping it here,
+      # once, keeps the key out of all of them (#5167). A copy: the caller's Config (and
+      # its logger) stay untouched.
+      @config = config.dup
+      @config.logger = RedactingLogger.wrap(config.logger, sdk_key)
       @clock = clock
       init_snapshot_state
       # Snapshot the (already-filtered) inspector list at construction: config is
@@ -379,6 +383,20 @@ module Featureflip
       @config.logger&.info("Featureflip: core shut down")
     end
 
+    def redact(text)
+      RedactingLogger.redact(text, @sdk_key)
+    end
+
+    # The caller sees the failure's class, message and backtrace with the key scrubbed.
+    # The original exception is not chained: its message may quote the Authorization
+    # header, and an explicit cause: stops Ruby attaching it as #cause implicitly.
+    def raise_sanitized_init_error(error)
+      sanitized = RuntimeError.new("#{error.class}: #{redact(error.message.to_s)}")
+      sanitized.set_backtrace(error.backtrace&.map { |l| redact(l) })
+      raise InitializationError.new("Failed to initialize: #{redact(error.message.to_s)} (#{error.class})"),
+        cause: sanitized
+    end
+
     def bootstrap!
       @http_client = Http::Client.new(@sdk_key, @config)
       fetch_initial_flags
@@ -405,7 +423,7 @@ module Featureflip
     rescue InitializationError
       raise
     rescue StandardError => e
-      raise InitializationError, "Failed to initialize: #{e.message}" if @config.snapshot_store.nil?
+      raise_sanitized_init_error(e) if @config.snapshot_store.nil?
 
       fall_back_to_snapshot(e, timed_out: false)
     end
@@ -421,7 +439,7 @@ module Featureflip
       return "timed out after #{@config.init_timeout}s" if timed_out
       return "HTTP #{error.status}" if error.respond_to?(:status) && error.status.is_a?(Integer)
 
-      message = error.message.to_s
+      message = redact(error.message.to_s)
       message.empty? ? error.class.name : message
     end
 
