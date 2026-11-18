@@ -27,4 +27,6 @@ Gem::Specification.new do |spec|
   spec.add_development_dependency "rspec", "~> 3.13"
   spec.add_development_dependency "webmock", "~> 3.23"
   spec.add_development_dependency "simplecov", "~> 1.0"
+  # Only the Rails integration spec loads it; it is never a runtime dependency.
+  spec.add_development_dependency "railties", ">= 7.1"
 end

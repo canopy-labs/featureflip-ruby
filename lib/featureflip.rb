@@ -20,6 +20,7 @@ require_relative "featureflip/data_source/streaming"
 require_relative "featureflip/data_source/polling"
 require_relative "featureflip/shared_core"
 require_relative "featureflip/client"
+require_relative "featureflip/railtie" if defined?(Rails::Railtie)
 
 module Featureflip
   @mutex = Mutex.new

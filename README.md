@@ -171,16 +171,23 @@ client.bool_variation("unknown", {}, false)           # => false (default)
 
 ## Rails Setup
 
-Featureflip is framework-agnostic. For Rails, initialize in an initializer:
+In a Rails app the gem starts the client for you at boot. Configure it in `config/application.rb` or an environment file:
 
 ```ruby
-# config/initializers/featureflip.rb
-Featureflip.configure do |c|
-  c.sdk_key = ENV["FEATUREFLIP_SDK_KEY"]
-  c.streaming = true
-end
+config.featureflip.sdk_key = ENV["FEATUREFLIP_SDK_KEY"] # optional, see below
+config.featureflip.poll_interval = 60
+```
 
-# For Puma/Unicorn/Passenger — respawn threads after fork
+Any `Featureflip::Config` option can be set on `config.featureflip`. The key is read from `config.featureflip.sdk_key`, then the `FEATUREFLIP_SDK_KEY` environment variable, then `credentials.featureflip.sdk_key`. If none is set, a warning is logged and no client is started.
+
+```ruby
+Rails.application.config.featureflip_client.bool_variation("my-feature", { "user_id" => "123" }, false)
+Featureflip.bool_variation("my-feature", { "user_id" => "123" }, false) # same client
+```
+
+The client is closed when the process exits. For Puma cluster mode, Unicorn and Passenger, respawn the background threads in each worker:
+
+```ruby
 # config/puma.rb
 on_worker_boot do
   Featureflip.restart

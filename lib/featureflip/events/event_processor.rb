@@ -50,11 +50,17 @@ module Featureflip
         @drain_started = 0
         @drain_finished = 0
         @drain_done = ConditionVariable.new
+
+        # The process whose events are in @queue. A forking server (Puma preload_app!,
+        # Unicorn) copies this object, queue and all, into every worker, but those events
+        # belong to the parent, which sends them itself. See #adopt_after_fork.
+        @pid = Process.pid
       end
 
       def queue_event(event)
         dropped = 0
         @mutex.synchronize do
+          adopt_after_fork
           # After #stop nothing will flush again, so buffering here would only leak.
           return if @stopped
 
@@ -81,6 +87,7 @@ module Featureflip
       # returned the in-flight promise (#2477).
       def flush
         mine = @mutex.synchronize do
+          adopt_after_fork
           if @drain_in_flight
             nil
           else
@@ -154,7 +161,10 @@ module Featureflip
         # Closed BEFORE the final flush so a failure there is dropped rather than
         # re-queued: nothing will flush again, and retrying until the queue drains would
         # hang shutdown for as long as the endpoint stayed down. One attempt, then let go.
-        @mutex.synchronize { @stopped = true }
+        @mutex.synchronize do
+          adopt_after_fork
+          @stopped = true
+        end
         # drain, not flush: shutdown must never be the call that gets coalesced
         # away. If the interval tick's drain happens to be in flight, flush would
         # wait for it and return, and anything queued after that loop's last look
@@ -166,6 +176,23 @@ module Featureflip
       end
 
       private
+
+      # First touch in a forked child: drop what was queued in the parent, which still
+      # sends those events itself, so sending them here too would deliver each one twice
+      # per worker (#5778). The coalescing state goes with it, because a drain that was in
+      # flight at the fork ran on a thread the child does not have, and waiting for it
+      # would hang. Events queued after this point are the child's own and are sent as
+      # usual. Caller holds @mutex.
+      def adopt_after_fork
+        return if @pid == Process.pid
+
+        @pid = Process.pid
+        @queue.clear
+        @drain_in_flight = false
+        @drain_finished = @drain_started
+        @auto_flush_in_flight = false
+        @next_auto_flush_at = 0.0
+      end
 
       # Batch-size-triggered flush. Returns true only if it actually sent.
       #

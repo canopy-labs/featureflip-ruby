@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.16.0 — 2026-11-18
+
+### Added
+
+- Rails integration. In a Rails app the gem now loads a railtie that starts the client when the app boots. Set options on `config.featureflip` (any `Featureflip::Config` option, with the SDK key from `sdk_key`, `FEATUREFLIP_SDK_KEY` or `credentials.featureflip.sdk_key`) and read the client from `Rails.application.config.featureflip_client`. With no key it logs a warning and starts nothing. The client is closed when the process exits. Rails is not a dependency of the gem, and apps without Rails load nothing extra.
+
+### Fixed
+
+- A forked worker (Puma `preload_app!`, Unicorn, Passenger) no longer re-sends the analytics events the parent had queued before the fork. The worker inherited a copy of the parent's event queue and sent it when it called `restart` or when its client was closed at exit, so every pre-fork event reached the server once per worker plus once from the parent. A worker now drops that inherited copy and sends only the events it records itself; the parent still sends its own. (#5778)
+
 ## 2.15.0 — 2026-11-16
 
 ### Security

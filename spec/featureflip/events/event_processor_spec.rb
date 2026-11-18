@@ -401,6 +401,70 @@ RSpec.describe Featureflip::Events::EventProcessor do
     end
   end
 
+  # A forking server (Puma preload_app!, Unicorn) copies the queue into every worker.
+  # Those events still belong to the parent, which sends them itself, so a worker that
+  # sent its copy would deliver each of them twice (#5778). Process.pid is stubbed to
+  # play the worker; the processor object is the one the fork copied.
+  describe "in a forked child" do
+    let(:parent_pid) { Process.pid }
+
+    def become_child
+      child_pid = parent_pid + 1
+      allow(Process).to receive(:pid).and_return(child_pid)
+    end
+
+    before { allow(http_client).to receive(:post_events) }
+
+    it "does not send the parent's queued events when stopped" do
+      processor.queue_event({ key: "from-parent" })
+      become_child
+
+      processor.stop
+
+      expect(http_client).not_to have_received(:post_events)
+    end
+
+    it "does not send the parent's queued events on an explicit flush" do
+      processor.queue_event({ key: "from-parent" })
+      become_child
+
+      processor.flush
+
+      expect(http_client).not_to have_received(:post_events)
+    end
+
+    it "still sends the events the child queues itself" do
+      processor.queue_event({ key: "from-parent" })
+      become_child
+
+      processor.queue_event({ key: "from-child" })
+      processor.stop
+
+      expect(http_client).to have_received(:post_events).once.with([{ key: "from-child" }])
+    end
+
+    # The parent's drain can be mid-request at the moment of the fork. Its thread does
+    # not exist in the child, so a flush there would wait for it forever.
+    it "does not wait on a drain that was in flight in the parent" do
+      processor.instance_variable_set(:@drain_in_flight, true)
+      processor.instance_variable_set(:@drain_started, 1)
+      become_child
+
+      processor.queue_event({ key: "from-child" })
+      Timeout.timeout(5) { processor.flush }
+
+      expect(http_client).to have_received(:post_events).once.with([{ key: "from-child" }])
+    end
+
+    it "keeps sending in the parent" do
+      processor.queue_event({ key: "from-parent" })
+
+      processor.stop
+
+      expect(http_client).to have_received(:post_events).once.with([{ key: "from-parent" }])
+    end
+  end
+
   # An instance_double cannot prove the shipped Http::Client actually surfaces the status
   # the processor branches on, nor that the single inline retry inside post_events survives
   # this change. These run the real client against a stubbed endpoint.
